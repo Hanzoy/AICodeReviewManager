@@ -1,0 +1,38 @@
+{
+  "name": "code-review-control-center",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n manager,web -c blue,green \"npm:dev:manager\" \"npm:dev:web\"",
+    "dev:web": "vite --host 0.0.0.0 --port 5173",
+    "dev:manager": "tsx watch server/manager/index.ts",
+    "start:manager": "tsx server/manager/index.ts",
+    "start:group": "tsx server/group/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "test:smoke": "tsx scripts/smoke-test.ts",
+    "test:review-worker": "tsx scripts/review-worker-test.ts"
+  },
+  "dependencies": {
+    "@ant-design/icons": "latest",
+    "@fastify/cors": "latest",
+    "antd": "latest",
+    "fastify": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  }
+}
