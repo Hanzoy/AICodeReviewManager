@@ -1,0 +1,48 @@
+name: code-review-group-node
+
+services:
+  group-node:
+    image: ${CODE_REVIEW_IMAGE:-code-review-helper:local}
+    build:
+      context: .
+      target: runtime
+      args:
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.211}
+    restart: unless-stopped
+    command: ["npm", "run", "start:group"]
+    environment:
+      MANAGER_URL: ${MANAGER_INTERNAL_URL:-http://manager:7000}
+      GROUP_ID: ${GROUP_ID:?GROUP_ID is required}
+      ENROLL_TOKEN: ${ENROLL_TOKEN:-}
+      GROUP_NAME: ${GROUP_NAME:-Docker project group node}
+      GROUP_HOST: 0.0.0.0
+      GROUP_PORT: 7100
+      GROUP_PUBLIC_URL: ${GROUP_PUBLIC_URL:-http://group-${GROUP_ID:?GROUP_ID is required}:7100}
+      GROUP_DATA_DIR: /app/data/group-node
+      GROUP_REPOSITORY_ROOT: /app/data/group-node/repositories
+      DEEPSEEK_REVIEW_COMMAND: claude
+    volumes:
+      - type: bind
+        source: ${CODE_REVIEW_DATA_DIR:-./data}/group-nodes/${GROUP_ID:?GROUP_ID is required}
+        target: /app/data/group-node
+    networks:
+      code-review:
+        aliases:
+          - group-${GROUP_ID:?GROUP_ID is required}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:7100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  code-review:
+    name: ${CODE_REVIEW_NETWORK:-code-review}
+    external: true

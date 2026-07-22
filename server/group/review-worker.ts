@@ -9,6 +9,7 @@ import type {
   ReviewProject,
   ReviewTask
 } from "../../shared/contracts.js";
+import { withGitSafeDirectory } from "./git-auth.js";
 import type { GroupConfigStore } from "./config-store.js";
 import { resolveGitRepositoryAccess } from "./git-auth.js";
 import { GitOperationCoordinator } from "./git-operation-coordinator.js";
@@ -240,7 +241,7 @@ export function parseReviewRuntimeOutput(raw: string) {
   return reviewResultSchema.parse(candidate) as ReviewResult;
 }
 
-function deepSeekEnvironment(config: GroupNodeConfig, apiKey: string) {
+function deepSeekEnvironment(config: GroupNodeConfig, apiKey: string, repositoryPath: string) {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -252,7 +253,7 @@ function deepSeekEnvironment(config: GroupNodeConfig, apiKey: string) {
   env.ANTHROPIC_DEFAULT_HAIKU_MODEL = config.ai.fastModel;
   env.CLAUDE_CODE_SUBAGENT_MODEL = config.ai.subagentModel;
   env.CLAUDE_CODE_EFFORT_LEVEL = config.ai.reasoningEffort;
-  return env;
+  return withGitSafeDirectory(env, repositoryPath);
 }
 
 const verdictLabels: Record<ReviewResult["verdict"], string> = {
@@ -652,7 +653,7 @@ export class ReviewWorker {
     try {
       commandResult = await this.runCommand(invocation.command, [...invocation.argsPrefix, ...args], {
         cwd: repositoryPath,
-        env: deepSeekEnvironment(config, apiKey),
+        env: deepSeekEnvironment(config, apiKey, repositoryPath),
         input: buildReviewPrompt(task, config, reviewInput),
         timeoutMs: config.ai.requestTimeoutSeconds * 1000
       });
@@ -779,7 +780,10 @@ export class ReviewWorker {
       const output = createWriteStream(filePath, { flags: "a" });
       const child = spawn("git", args, {
         cwd: repositoryPath,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        env: withGitSafeDirectory(
+          { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          repositoryPath
+        ),
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         shell: false
@@ -875,9 +879,13 @@ export class ReviewWorker {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      const commandEnvironment = options.env ?? process.env;
+      const environment = path.basename(command).toLowerCase() === "git"
+        ? withGitSafeDirectory(commandEnvironment, options.cwd)
+        : commandEnvironment;
       const child = spawn(command, args, {
         cwd: options.cwd,
-        env: options.env ?? process.env,
+        env: environment,
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
         shell: false

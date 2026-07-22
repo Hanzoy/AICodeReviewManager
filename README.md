@@ -34,6 +34,89 @@
 - npm 10 或更高版本
 - 项目组节点 Review 运行时
 
+## Docker 部署（推荐）
+
+Docker 方案包含两个镜像：
+
+- `code-review-helper`：管理 API 与项目组节点共用的 Node.js 镜像，已包含 Git、SSH 客户端和 Review 执行器。
+- `code-review-helper-web`：静态管理界面和到管理 API 的反向代理。
+
+Docker 通过 bind mount 直接使用项目现有的 `data/`：管理端挂载 `data/manager`，每个项目组节点挂载 `data/group-nodes/<GROUP_ID>`。容器运行时会把仓库根目录覆盖为 `/app/data/group-node/repositories`，但不会改写 `config.json` 中原有的 Windows 路径，因此 Docker 与直接运行 Node 可以交替读取同一份历史数据。删除或升级容器不会删除宿主机数据。不要让 Node 进程和对应 Docker 容器同时运行，以免并发写文件或操作同一个 Git 仓库。
+
+### 1. 启动管理端
+
+需要 Docker Engine 24+ 和 Docker Compose v2。复制配置示例并按实际访问地址修改：
+
+```bash
+cp .env.docker.example .env.docker
+```
+
+至少检查 `MANAGER_PUBLIC_URL`。该地址会用于生成节点注册码和 GitLab Webhook URL，必须能够被项目组节点和 GitLab 访问。仅在本机试用时可以保留 `http://localhost:5173`；服务器部署应改为域名或服务器 IP，例如 `https://code-review.example.com`。
+
+```bash
+docker compose --env-file .env.docker up -d --build
+docker compose ps
+```
+
+默认管理界面为 `http://localhost:5173`。查看日志：
+
+```bash
+docker compose logs -f manager web
+```
+
+### 2. 启动项目组节点
+
+先在管理界面创建项目组并点击“注册节点”，复制弹窗中的“项目组 ID”和“注册代码”。然后为该节点准备独立配置：
+
+```bash
+cp .env.group.example .env.group
+```
+
+编辑 `.env.group` 中的 `GROUP_ID`、`ENROLL_TOKEN` 和 `GROUP_NAME`，再启动节点：
+
+```bash
+docker compose --env-file .env.group -f compose.group.yaml -p code-review-team-a up -d --build
+docker compose --env-file .env.group -f compose.group.yaml -p code-review-team-a ps
+```
+
+`-p` 名称用于区分不同项目组。增加项目组时，为每个节点使用不同的 `.env.group-*` 文件和不同的 `-p` 名称。首次注册后，长期节点凭据保存在宿主机的 `data/group-nodes/<GROUP_ID>` 中，后续重启不需要生成新注册码。
+
+查看节点日志：
+
+```bash
+docker compose --env-file .env.group -f compose.group.yaml -p code-review-team-a logs -f group-node
+```
+
+### 3. 生产环境入口
+
+推荐在现有 Nginx、Traefik 或云负载均衡器后终止 HTTPS，并把流量转发到本机 `5173` 端口。此时可在 `.env.docker` 中设置：
+
+```dotenv
+WEB_BIND_ADDRESS=127.0.0.1
+MANAGER_PUBLIC_URL=https://code-review.example.com
+```
+
+反向代理必须同时转发普通页面、`/api/*` 和 `/hooks/*`；不要只转发首页。GitLab Webhook 使用 `/hooks/*`。
+
+### 4. 升级与数据
+
+源码部署升级：
+
+```bash
+git pull
+docker compose --env-file .env.docker up -d --build
+docker compose --env-file .env.group -f compose.group.yaml -p code-review-team-a up -d --build
+```
+
+默认宿主机数据目录：
+
+- 管理端：`data/manager`
+- 项目组节点：`data/group-nodes/<GROUP_ID>`
+
+可通过 `CODE_REVIEW_DATA_DIR` 指定绝对路径，例如 Windows 使用 `E:/Projects/CodeReviewHelper/data`。备份时应停止管理端和所有项目组节点，再完整备份该数据根目录。不要只备份 `manager`；GitLab、AI、飞书密钥、仓库和 Review 结果都保存在对应的 `group-nodes` 目录中。
+
+如果项目组节点与管理端不在同一台 Docker 主机，需要让双方网络互通：将 `MANAGER_INTERNAL_URL` 改为节点可访问的管理端地址，并把 `GROUP_PUBLIC_URL` 设置为管理端可回连的节点地址，同时自行发布和保护节点的 `7100` 端口。同机部署不需要暴露节点端口。
+
 ## 启动总管理端
 
 ```bash

@@ -9,6 +9,19 @@ export interface GitRepositoryAccess {
   authentication: "gitlab-token" | "local";
 }
 
+export function withGitSafeDirectory(
+  environment: NodeJS.ProcessEnv,
+  repositoryPath: string
+): NodeJS.ProcessEnv {
+  const next = { ...environment };
+  const configuredCount = Number.parseInt(next.GIT_CONFIG_COUNT ?? "0", 10);
+  const count = Number.isSafeInteger(configuredCount) && configuredCount >= 0 ? configuredCount : 0;
+  next.GIT_CONFIG_COUNT = String(count + 1);
+  next[`GIT_CONFIG_KEY_${count}`] = "safe.directory";
+  next[`GIT_CONFIG_VALUE_${count}`] = path.resolve(repositoryPath);
+  return next;
+}
+
 export async function gitEnvironment(
   dataDir: string,
   repositoryUrl: string,
@@ -31,9 +44,11 @@ export async function gitEnvironment(
   environment.CODE_REVIEW_GITLAB_TOKEN = gitlabToken;
   // Do not let a machine-level credential helper silently authenticate as the
   // interactive desktop user before Git asks our project-group AskPass helper.
-  environment.GIT_CONFIG_COUNT = "1";
-  environment.GIT_CONFIG_KEY_0 = "credential.helper";
-  environment.GIT_CONFIG_VALUE_0 = "";
+  const configuredCount = Number.parseInt(environment.GIT_CONFIG_COUNT ?? "0", 10);
+  const count = Number.isSafeInteger(configuredCount) && configuredCount >= 0 ? configuredCount : 0;
+  environment.GIT_CONFIG_COUNT = String(count + 1);
+  environment[`GIT_CONFIG_KEY_${count}`] = "credential.helper";
+  environment[`GIT_CONFIG_VALUE_${count}`] = "";
   return environment;
 }
 

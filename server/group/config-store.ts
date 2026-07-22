@@ -32,7 +32,8 @@ export class GroupConfigStore {
 
   constructor(
     private readonly dataDir: string,
-    private readonly groupName: string
+    private readonly groupName: string,
+    private readonly repositoryRootOverride?: string
   ) {
     this.configFile = path.join(dataDir, "config.json");
     this.keyFile = path.join(dataDir, "secret.key");
@@ -229,6 +230,9 @@ export class GroupConfigStore {
   private toPublicConfig(config: StoredGroupConfig, secrets: GroupSecrets): GroupNodeConfig {
     return {
       ...config,
+      repository: this.repositoryRootOverride
+        ? { ...config.repository, rootPath: this.repositoryRootOverride }
+        : config.repository,
       gitlab: { ...config.gitlab, tokenConfigured: Boolean(secrets.gitlabToken) },
       ai: { ...config.ai, apiKeyConfigured: Boolean(secrets.aiApiKey) },
       feishu: {
@@ -267,6 +271,8 @@ export class GroupConfigStore {
     return this.withWrite(async () => {
       const current = await this.readStoredConfig();
       const secrets = await this.readSecrets();
+      const repositoryUpdate = { ...(input.repository ?? {}) };
+      if (this.repositoryRootOverride) delete repositoryUpdate.rootPath;
       const { token: gitlabToken, ...gitlab } = input.gitlab ?? {};
       const { apiKey, ...ai } = input.ai ?? {};
       const { webhookUrl, signingSecret, ...feishu } = input.feishu ?? {};
@@ -275,7 +281,7 @@ export class GroupConfigStore {
         revision: current.revision + 1,
         updatedAt: new Date().toISOString(),
         general: { ...current.general, ...input.general },
-        repository: { ...current.repository, ...input.repository },
+        repository: { ...current.repository, ...repositoryUpdate },
         gitlab: { ...current.gitlab, ...gitlab },
         ai: { ...current.ai, ...ai },
         feishu: { ...current.feishu, ...feishu }

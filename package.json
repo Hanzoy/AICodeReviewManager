@@ -23,6 +23,7 @@
     "fastify": "latest",
     "react": "latest",
     "react-dom": "latest",
+    "tsx": "latest",
     "zod": "latest"
   },
   "devDependencies": {
@@ -31,7 +32,6 @@
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "latest",
     "concurrently": "latest",
-    "tsx": "latest",
     "typescript": "latest",
     "vite": "latest"
   }

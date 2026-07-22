@@ -1,0 +1,62 @@
+name: code-review-control-center
+
+services:
+  manager:
+    image: ${CODE_REVIEW_IMAGE:-code-review-helper:local}
+    build:
+      context: .
+      target: runtime
+      args:
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.211}
+    restart: unless-stopped
+    environment:
+      MANAGER_HOST: 0.0.0.0
+      MANAGER_PORT: 7000
+      MANAGER_PUBLIC_URL: ${MANAGER_PUBLIC_URL:-http://localhost:5173}
+      MANAGER_DATA_DIR: /app/data/manager
+    volumes:
+      - type: bind
+        source: ${CODE_REVIEW_DATA_DIR:-./data}/manager
+        target: /app/data/manager
+    networks:
+      code-review:
+        aliases:
+          - manager
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:7000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    image: ${CODE_REVIEW_WEB_IMAGE:-code-review-helper-web:local}
+    build:
+      context: .
+      target: web
+    restart: unless-stopped
+    depends_on:
+      manager:
+        condition: service_healthy
+    ports:
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-5173}:80"
+    networks:
+      - code-review
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  code-review:
+    name: ${CODE_REVIEW_NETWORK:-code-review}

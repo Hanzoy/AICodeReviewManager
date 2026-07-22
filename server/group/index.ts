@@ -45,11 +45,13 @@ async function requestJson<T>(url: string, init: RequestInit): Promise<T> {
 
 const host = argument("host") ?? process.env.GROUP_HOST ?? "127.0.0.1";
 const requestedPort = Number(argument("port") ?? process.env.GROUP_PORT ?? 0);
+const configuredPublicUrl = argument("public-url") ?? process.env.GROUP_PUBLIC_URL;
 const managerUrlArg = argument("manager-url") ?? process.env.MANAGER_URL;
 const groupIdArg = argument("group-id") ?? process.env.GROUP_ID;
 const enrollmentToken = argument("enroll-token") ?? process.env.ENROLL_TOKEN;
 const groupName = argument("name") ?? process.env.GROUP_NAME ?? "项目组节点";
 const dataDir = argument("data-dir") ?? process.env.GROUP_DATA_DIR ?? "./data/group-node";
+const repositoryRootOverride = argument("repository-root") ?? process.env.GROUP_REPOSITORY_ROOT;
 const version = "0.1.0";
 const startedAt = new Date().toISOString();
 const instanceId = randomUUID();
@@ -185,7 +187,7 @@ const mergeRequestWebhookSchema = z.object({
   })
 });
 
-const configStore = new GroupConfigStore(dataDir, groupName);
+const configStore = new GroupConfigStore(dataDir, groupName, repositoryRootOverride);
 await configStore.init();
 let groupConfig = await configStore.get();
 const projectStore = new ProjectStore(dataDir, managerUrl, groupId);
@@ -405,15 +407,23 @@ app.post<{ Params: { hookKey: string } }>("/hooks/gitlab/:hookKey", async (reque
 await app.listen({ host, port: requestedPort });
 const actualPort = (app.server.address() as AddressInfo).port;
 const callbackHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-const baseUrl = `http://${callbackHost}:${actualPort}`;
+const baseUrl = configuredPublicUrl?.replace(/\/+$/, "") ?? `http://${callbackHost}:${actualPort}`;
+const advertisedUrl = configuredPublicUrl ? new URL(baseUrl) : undefined;
+if (advertisedUrl && !["http:", "https:"].includes(advertisedUrl.protocol)) {
+  throw new Error("GROUP_PUBLIC_URL 仅支持 http:// 或 https:// 地址");
+}
+const advertisedHost = advertisedUrl?.hostname ?? callbackHost;
+const advertisedPort = advertisedUrl
+  ? Number(advertisedUrl.port || (advertisedUrl.protocol === "https:" ? 443 : 80))
+  : actualPort;
 runtimeStatus = { ...runtimeStatus, port: actualPort };
 
 const registration: NodeRegistrationInput = {
   groupId,
   instanceId,
   name: groupName,
-  host: callbackHost,
-  port: actualPort,
+  host: advertisedHost,
+  port: advertisedPort,
   baseUrl,
   version,
   capabilities,

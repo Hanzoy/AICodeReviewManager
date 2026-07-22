@@ -14,7 +14,7 @@ import type {
   ManualReviewSelection,
   ReviewProject
 } from "../../shared/contracts.js";
-import { resolveGitRepositoryAccess } from "./git-auth.js";
+import { resolveGitRepositoryAccess, withGitSafeDirectory } from "./git-auth.js";
 
 const OUTPUT_LIMIT = 8 * 1024 * 1024;
 const COMMIT_CACHE_OUTPUT_LIMIT = 128 * 1024 * 1024;
@@ -38,10 +38,6 @@ interface GraphLane {
 
 function normalizeRemote(value: string) {
   const trimmed = value.trim();
-  const scpStyle = trimmed.match(/^(?:[^@]+@)?([^:]+):(.+)$/);
-  if (scpStyle && !/^[A-Za-z]:[\\/]/.test(trimmed)) {
-    return `${scpStyle[1]}/${scpStyle[2]}`.replace(/\.git\/?$/i, "").toLowerCase();
-  }
   if (/^(?:https?|ssh|git):\/\//i.test(trimmed)) {
     try {
       const parsed = new URL(trimmed);
@@ -49,6 +45,10 @@ function normalizeRemote(value: string) {
     } catch {
       // Fall through to local-path normalization.
     }
+  }
+  const scpStyle = trimmed.match(/^(?:[^@]+@)?([^:]+):(.+)$/);
+  if (scpStyle && !/^[A-Za-z]:[\\/]/.test(trimmed)) {
+    return `${scpStyle[1]}/${scpStyle[2]}`.replace(/\.git\/?$/i, "").toLowerCase();
   }
   return trimmed.replaceAll("\\", "/").replace(/\.git\/?$/i, "").replace(/\/$/, "").toLowerCase();
 }
@@ -87,7 +87,7 @@ export class GitRepositoryService {
       const child = spawn("git", ["-C", repositoryPath, ...args], {
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: environment
+        env: withGitSafeDirectory(environment, repositoryPath)
       });
       let stdout = "";
       let stderr = "";
