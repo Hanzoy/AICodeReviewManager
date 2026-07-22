@@ -20,7 +20,9 @@ import type {
   UpdateReviewProjectInput
 } from "../shared/contracts";
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+const pendingGetRequests = new Map<string, Promise<unknown>>();
+
+async function performRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body !== undefined && init.body !== null && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
@@ -45,6 +47,19 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method !== "GET" || init?.body !== undefined) return performRequest<T>(url, init);
+  const pending = pendingGetRequests.get(url);
+  if (pending) return pending as Promise<T>;
+  const operation = performRequest<T>(url, init);
+  pendingGetRequests.set(url, operation);
+  void operation.finally(() => {
+    if (pendingGetRequests.get(url) === operation) pendingGetRequests.delete(url);
+  }).catch(() => undefined);
+  return operation;
 }
 
 export const managerApi = {

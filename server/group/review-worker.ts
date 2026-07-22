@@ -506,6 +506,7 @@ export class ReviewWorker {
     });
     const { environment, repositoryUrl } = access;
     let repositoryExists = false;
+    let repositoryCreated = false;
     try {
       repositoryExists = (await stat(gitDirectory)).isDirectory();
     } catch {
@@ -520,7 +521,15 @@ export class ReviewWorker {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
       await mkdir(path.dirname(repositoryPath), { recursive: true });
-      const cloneArgs = ["clone", "--origin", "origin"];
+      const cloneArgs = [
+        "clone",
+        "--origin", "origin",
+        "--no-checkout",
+        "--no-tags",
+        "--single-branch",
+        "--branch", task.targetBranch,
+        "--filter=blob:none"
+      ];
       if (config.repository.cloneDepth > 0) {
         cloneArgs.push("--depth", String(config.repository.cloneDepth));
       }
@@ -530,15 +539,23 @@ export class ReviewWorker {
         env: environment,
         timeoutMs: config.gitlab.requestTimeoutSeconds * 1000 * 10
       });
+      repositoryCreated = true;
     }
 
-    const status = await this.runCommand("git", ["status", "--porcelain"], {
-      cwd: repositoryPath,
-      env: environment,
-      timeoutMs: 30_000
-    });
-    if (status.stdout.trim()) {
-      throw new Error(`仓库存在未提交修改，已停止自动切换分支：${repositoryPath}`);
+    if (!repositoryCreated) {
+      const status = await this.runCommand("git", [
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        "--ignore-submodules=all"
+      ], {
+        cwd: repositoryPath,
+        env: environment,
+        timeoutMs: 30_000
+      });
+      if (status.stdout.trim()) {
+        throw new Error(`仓库存在未提交修改，已停止自动切换分支：${repositoryPath}`);
+      }
     }
 
     await this.runCommand("git", ["remote", "set-url", "origin", repositoryUrl], {
@@ -546,7 +563,13 @@ export class ReviewWorker {
       env: environment,
       timeoutMs: 30_000
     });
-    const fetchArgs = ["fetch", "--prune", "origin"];
+    const fetchArgs = [
+      "fetch",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--no-write-fetch-head",
+      "origin"
+    ];
     if (config.repository.cloneDepth > 0) {
       fetchArgs.push("--depth", String(config.repository.cloneDepth));
     }

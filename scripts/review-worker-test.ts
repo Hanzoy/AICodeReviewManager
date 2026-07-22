@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type { ReviewResult } from "../shared/contracts.js";
@@ -272,6 +272,19 @@ try {
   if (!syncResult.changed || !commitsAfterSync.cache.syncedAt || commitsAfterSync.cache.commitCount < commits.items.length) {
     throw new Error("Repository sync did not fetch remote branches and warm the Commit cache");
   }
+  const projectCacheFile = path.join(root, "commit-cache", `${credentials.project.id}.json`);
+  const cacheModifiedBeforeNoopSync = (await stat(projectCacheFile)).mtimeMs;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const noopSyncResult = await gitRepository.sync(credentials.project, {
+    cloneDepth: 0,
+    requestTimeoutSeconds: 30,
+    gitlabToken: "integration-test-token",
+    gitlabConfig: workerConfig.gitlab
+  });
+  const cacheModifiedAfterNoopSync = (await stat(projectCacheFile)).mtimeMs;
+  if (noopSyncResult.changed || cacheModifiedAfterNoopSync !== cacheModifiedBeforeNoopSync) {
+    throw new Error("No-op Repository sync rewrote the large Commit cache");
+  }
 
   const coordinator = new GitOperationCoordinator();
   const operationOrder: string[] = [];
@@ -310,6 +323,8 @@ try {
   await command("git", ["add", "."], graphRepositoryPath);
   await command("git", ["commit", "-m", "main branch commit"], graphRepositoryPath);
   await command("git", ["merge", "--no-ff", "feature/cache", "-m", "merge feature cache"], graphRepositoryPath);
+  const graphHeadBeforeIncrementalRefresh = await command("git", ["rev-parse", "HEAD"], graphRepositoryPath);
+  await command("git", ["tag", "cache-marker"], graphRepositoryPath);
 
   const graphProject = {
     ...credentials.project,
@@ -334,6 +349,28 @@ try {
     authorCommits.items[0]?.authorName !== "Branch Author"
   ) {
     throw new Error("Commit graph cache, branch topology, or author filtering is incorrect");
+  }
+  await writeFile(path.join(graphRepositoryPath, "incremental.txt"), "incremental\n", "utf8");
+  await command("git", ["add", "."], graphRepositoryPath);
+  await command("git", ["commit", "-m", "incremental cache commit"], graphRepositoryPath);
+  await command("git", ["tag", "-f", "cache-marker"], graphRepositoryPath);
+  const incrementallyRefreshedCommits = await gitRepository.commits(graphProject, { page: 1, pageSize: 20 });
+  const persistedGraphCache = JSON.parse(await readFile(
+    path.join(root, "commit-cache", "graph-project.json"),
+    "utf8"
+  )) as {
+    refreshMode?: string;
+    addedCommitCount?: number;
+  };
+  if (
+    !incrementallyRefreshedCommits.cache.refreshed ||
+    incrementallyRefreshedCommits.items[0]?.subject !== "incremental cache commit" ||
+    !incrementallyRefreshedCommits.items[0]?.refs.includes("cache-marker") ||
+    incrementallyRefreshedCommits.items.find((commit) => commit.sha === graphHeadBeforeIncrementalRefresh)?.refs.includes("cache-marker") ||
+    persistedGraphCache.refreshMode !== "incremental" ||
+    persistedGraphCache.addedCommitCount !== 1
+  ) {
+    throw new Error("Incremental Commit cache refresh did not add metadata or rebuild moved refs correctly");
   }
   const manualPreview = await gitRepository.preview(credentials.project, {
     mode: "commits",
