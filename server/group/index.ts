@@ -418,6 +418,17 @@ const advertisedPort = advertisedUrl
   : actualPort;
 runtimeStatus = { ...runtimeStatus, port: actualPort };
 
+// Parse persisted Commit caches in the background once per node process. Opening a
+// large project then only verifies refs instead of blocking on a multi-megabyte JSON read.
+void projectStore.list(groupConfig.repository.rootPath)
+  .then((projects) => gitRepository.preloadCommitCaches(projects))
+  .catch((error: unknown) => {
+    app.log.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      "Commit cache preload failed"
+    );
+  });
+
 const registration: NodeRegistrationInput = {
   groupId,
   instanceId,

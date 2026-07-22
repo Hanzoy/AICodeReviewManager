@@ -17,8 +17,16 @@ import type {
 import { resolveGitRepositoryAccess, withGitSafeDirectory } from "./git-auth.js";
 
 const OUTPUT_LIMIT = 8 * 1024 * 1024;
-const COMMIT_CACHE_OUTPUT_LIMIT = 128 * 1024 * 1024;
+const COMMIT_CACHE_OUTPUT_LIMIT = 512 * 1024 * 1024;
 const COMMIT_CACHE_SCHEMA_VERSION = 1;
+const REPOSITORY_STATUS_TTL_MS = 5_000;
+const BRANCH_CACHE_TTL_MS = 15_000;
+const INCREMENTAL_COMMIT_LIMIT = 5_000;
+const COMMIT_METADATA_CHUNK_SIZE = 250;
+const MAX_DERIVED_BRANCH_SCOPES = 20;
+const MAX_MEMORY_COMMIT_CACHES = 3;
+const MAX_MEMORY_CACHED_COMMITS = 300_000;
+const PRELOAD_CACHE_FILE_BUDGET = 64 * 1024 * 1024;
 
 type CachedGitCommit = Omit<GitCommitSummary, "graph">;
 
@@ -28,7 +36,20 @@ interface CommitCacheFile {
   fingerprint: string;
   generatedAt: string;
   syncedAt?: string;
+  refreshMode?: "full" | "incremental";
+  addedCommitCount?: number;
+  removedCommitCount?: number;
   commits: CachedGitCommit[];
+}
+
+interface DerivedCommitScope {
+  commits: CachedGitCommit[];
+  authors: GitCommitPage["authors"];
+}
+
+interface DerivedCommitCache {
+  commitsBySha: Map<string, CachedGitCommit>;
+  scopes: Map<string, DerivedCommitScope>;
 }
 
 interface GraphLane {
@@ -53,6 +74,14 @@ function normalizeRemote(value: string) {
   return trimmed.replaceAll("\\", "/").replace(/\.git\/?$/i, "").replace(/\/$/, "").toLowerCase();
 }
 
+function sameRepositoryPath(left: string, right: string) {
+  const normalize = (value: string) => {
+    const resolved = path.resolve(value).replaceAll("\\", "/");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
 function parseNumstat(output: string) {
   const files = new Set<string>();
   let additions = 0;
@@ -70,6 +99,23 @@ function parseNumstat(output: string) {
 export class GitRepositoryService {
   private readonly memoryCommitCaches = new Map<string, CommitCacheFile>();
   private readonly pendingCommitCaches = new Map<string, Promise<{ cache: CommitCacheFile; refreshed: boolean }>>();
+  private readonly derivedCommitCaches = new WeakMap<CommitCacheFile, DerivedCommitCache>();
+  private readonly repositoryStatusCaches = new Map<string, {
+    repositoryPath: string;
+    repositoryUrl: string;
+    expiresAt: number;
+    status: GitRepositoryStatus;
+  }>();
+  private readonly branchCaches = new Map<string, {
+    repositoryPath: string;
+    expiresAt: number;
+    items: GitBranchSummary[];
+  }>();
+  private readonly repositoryValidations = new Map<string, {
+    repositoryPath: string;
+    expiresAt: number;
+    currentBranch?: string;
+  }>();
 
   constructor(
     private readonly commitCacheRoot: string,
@@ -110,7 +156,7 @@ export class GitRepositoryService {
       });
       child.once("close", (code) => {
         clearTimeout(timer);
-        if (outputLimitExceeded) reject(new Error("Git 提交元数据超过 128 MB，无法建立本地缓存"));
+        if (outputLimitExceeded) reject(new Error(`Git 命令输出超过 ${Math.ceil(outputLimit / 1024 / 1024)} MB 限制`));
         else if (code === 0) resolve(stdout.trim());
         else reject(new Error(stderr.trim() || `git ${args[0]} 执行失败（${code}）`));
       });
@@ -128,6 +174,15 @@ export class GitRepositoryService {
   }
 
   async status(project: ReviewProject): Promise<GitRepositoryStatus> {
+    const cached = this.repositoryStatusCaches.get(project.id);
+    if (
+      cached &&
+      cached.expiresAt > Date.now() &&
+      cached.repositoryPath === project.localRepositoryPath &&
+      cached.repositoryUrl === project.repositoryUrl
+    ) {
+      return cached.status;
+    }
     const checkedAt = new Date().toISOString();
     const repositoryPath = project.localRepositoryPath;
     if (!(await this.exists(repositoryPath))) {
@@ -151,7 +206,7 @@ export class GitRepositoryService {
         this.command(repositoryPath, ["rev-parse", "HEAD"]).catch(() => ""),
         this.command(repositoryPath, ["remote", "get-url", "origin"]).catch(() => "")
       ]);
-      return {
+      const status: GitRepositoryStatus = {
         exists: true,
         valid: inside === "true" && !bare,
         bare,
@@ -168,6 +223,20 @@ export class GitRepositoryService {
             ? "该目录不是可用的非裸 Git 工作仓库。"
             : undefined
       };
+      this.repositoryStatusCaches.set(project.id, {
+        repositoryPath,
+        repositoryUrl: project.repositoryUrl,
+        expiresAt: Date.now() + REPOSITORY_STATUS_TTL_MS,
+        status
+      });
+      if (status.valid && !status.locked) {
+        this.repositoryValidations.set(project.id, {
+          repositoryPath,
+          expiresAt: Date.now() + REPOSITORY_STATUS_TTL_MS,
+          currentBranch: status.currentBranch
+        });
+      }
+      return status;
     } catch (error) {
       return {
         exists: true,
@@ -188,18 +257,36 @@ export class GitRepositoryService {
     if (await this.exists(path.join(repositoryPath, ".git", "index.lock"))) {
       throw new Error("LOCAL_REPOSITORY_LOCKED");
     }
+    const cached = this.repositoryValidations.get(project.id);
+    if (
+      cached &&
+      cached.expiresAt > Date.now() &&
+      cached.repositoryPath === repositoryPath
+    ) {
+      return { currentBranch: cached.currentBranch };
+    }
     const [inside, bare, currentBranch] = await Promise.all([
       this.command(repositoryPath, ["rev-parse", "--is-inside-work-tree"]),
       this.command(repositoryPath, ["rev-parse", "--is-bare-repository"]),
       this.command(repositoryPath, ["branch", "--show-current"]).catch(() => "")
     ]);
     if (inside !== "true" || bare === "true") throw new Error("LOCAL_REPOSITORY_NOT_READY");
+    this.repositoryValidations.set(project.id, {
+      repositoryPath,
+      expiresAt: Date.now() + REPOSITORY_STATUS_TTL_MS,
+      currentBranch: currentBranch || undefined
+    });
     return { currentBranch: currentBranch || undefined };
   }
 
   private commitCacheFile(project: ReviewProject) {
     const safeProjectId = project.id.replace(/[^A-Za-z0-9_-]/g, "_");
     return path.join(this.commitCacheRoot, `${safeProjectId}.json`);
+  }
+
+  private commitCacheMetadataFile(project: ReviewProject) {
+    const safeProjectId = project.id.replace(/[^A-Za-z0-9_-]/g, "_");
+    return path.join(this.commitCacheRoot, `${safeProjectId}.meta.json`);
   }
 
   private async commitFingerprint(repositoryPath: string) {
@@ -228,12 +315,18 @@ export class GitRepositoryService {
       cache.commits.every((commit) => Boolean(
         commit &&
         typeof commit.sha === "string" &&
+        typeof commit.shortSha === "string" &&
         Array.isArray(commit.parentShas) &&
-        typeof commit.subject === "string"
+        typeof commit.subject === "string" &&
+        typeof commit.authorName === "string" &&
+        typeof commit.authorEmail === "string" &&
+        typeof commit.authoredAt === "string" &&
+        Array.isArray(commit.refs)
       ));
   }
 
   private parseCommitLog(output: string): CachedGitCommit[] {
+    if (!output) return [];
     return output.split(/\r?\n/).filter(Boolean).map((line) => {
       const [sha, shortSha, parents, subject, authorName, authorEmail, authoredAt, refs] = line.split("\0");
       return {
@@ -247,6 +340,196 @@ export class GitRepositoryService {
         refs: refs ? refs.split(", ").map((item) => item.trim()).filter(Boolean) : []
       };
     });
+  }
+
+  private async readCommitCache(project: ReviewProject) {
+    try {
+      const cache = JSON.parse(await readFile(this.commitCacheFile(project), "utf8")) as unknown;
+      if (!this.validCommitCache(cache) || !sameRepositoryPath(cache.repositoryPath, project.localRepositoryPath)) {
+        return undefined;
+      }
+      try {
+        const metadata = JSON.parse(await readFile(this.commitCacheMetadataFile(project), "utf8")) as {
+          syncedAt?: unknown;
+        };
+        if (typeof metadata.syncedAt === "string") cache.syncedAt = metadata.syncedAt;
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code !== "ENOENT" &&
+          (error as Error).name !== "SyntaxError"
+        ) throw error;
+      }
+      return cache;
+    } catch (error) {
+      if ((["ENOENT", "SyntaxError"] as string[]).includes((error as NodeJS.ErrnoException).code ?? (error as Error).name)) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private rememberCommitCache(projectId: string, cache: CommitCacheFile) {
+    this.memoryCommitCaches.delete(projectId);
+    this.memoryCommitCaches.set(projectId, cache);
+    const cachedCommitCount = () => [...this.memoryCommitCaches.values()]
+      .reduce((total, item) => total + item.commits.length, 0);
+    while (
+      this.memoryCommitCaches.size > 1 &&
+      (
+        this.memoryCommitCaches.size > MAX_MEMORY_COMMIT_CACHES ||
+        cachedCommitCount() > MAX_MEMORY_CACHED_COMMITS
+      )
+    ) {
+      const oldestProjectId = this.memoryCommitCaches.keys().next().value as string | undefined;
+      if (!oldestProjectId) break;
+      this.memoryCommitCaches.delete(oldestProjectId);
+    }
+  }
+
+  async preloadCommitCaches(projects: ReviewProject[]) {
+    const candidates: Array<{ project: ReviewProject; size: number; modifiedAt: number }> = [];
+    for (const project of projects) {
+      try {
+        const cacheStat = await stat(this.commitCacheFile(project));
+        candidates.push({ project, size: cacheStat.size, modifiedAt: cacheStat.mtimeMs });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    candidates.sort((a, b) => b.modifiedAt - a.modifiedAt);
+    let remainingBudget = PRELOAD_CACHE_FILE_BUDGET;
+    for (const { project, size } of candidates) {
+      if (size > remainingBudget) continue;
+      if (this.memoryCommitCaches.has(project.id)) continue;
+      const cache = await this.readCommitCache(project);
+      if (cache && !this.memoryCommitCaches.has(project.id)) {
+        this.rememberCommitCache(project.id, cache);
+        remainingBudget -= size;
+      }
+    }
+  }
+
+  private async commitOrder(repositoryPath: string) {
+    const output = await this.command(
+      repositoryPath,
+      ["rev-list", "--all", "--topo-order"],
+      180_000,
+      COMMIT_CACHE_OUTPUT_LIMIT
+    );
+    return output.split(/\r?\n/).filter(Boolean);
+  }
+
+  private async commitRefs(repositoryPath: string) {
+    const output = await this.command(repositoryPath, [
+      "for-each-ref",
+      "--sort=refname",
+      "--format=%(objectname)%00%(*objectname)%00%(refname:short)",
+      "refs/heads",
+      "refs/remotes",
+      "refs/tags"
+    ], 60_000, COMMIT_CACHE_OUTPUT_LIMIT);
+    const refsBySha = new Map<string, string[]>();
+    for (const line of output.split(/\r?\n/).filter(Boolean)) {
+      const [objectSha, peeledSha, refName] = line.split("\0");
+      const sha = peeledSha || objectSha;
+      if (!sha || !refName || refName.endsWith("/HEAD")) continue;
+      const refs = refsBySha.get(sha);
+      if (refs) refs.push(refName);
+      else refsBySha.set(sha, [refName]);
+    }
+    return refsBySha;
+  }
+
+  private async loadMissingCommitMetadata(repositoryPath: string, commitShas: string[]) {
+    const commits: CachedGitCommit[] = [];
+    for (let offset = 0; offset < commitShas.length; offset += COMMIT_METADATA_CHUNK_SIZE) {
+      const chunk = commitShas.slice(offset, offset + COMMIT_METADATA_CHUNK_SIZE);
+      const output = await this.command(repositoryPath, [
+        "log",
+        "--no-walk=unsorted",
+        "--format=%H%x00%h%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00%D",
+        ...chunk
+      ], 120_000, COMMIT_CACHE_OUTPUT_LIMIT);
+      commits.push(...this.parseCommitLog(output));
+    }
+    return commits;
+  }
+
+  private async rebuildCommitCache(
+    project: ReviewProject,
+    fingerprint: string,
+    baseline?: CommitCacheFile
+  ) {
+    const repositoryPath = project.localRepositoryPath;
+    if (!baseline) {
+      const output = await this.command(repositoryPath, [
+        "log",
+        "--all",
+        "--topo-order",
+        "--format=%H%x00%h%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00%D"
+      ], 300_000, COMMIT_CACHE_OUTPUT_LIMIT);
+      const refsBySha = await this.commitRefs(repositoryPath);
+      const commits = this.parseCommitLog(output)
+        .map((commit) => ({ ...commit, refs: refsBySha.get(commit.sha) ?? [] }));
+      return {
+        schemaVersion: COMMIT_CACHE_SCHEMA_VERSION,
+        repositoryPath,
+        fingerprint,
+        generatedAt: new Date().toISOString(),
+        refreshMode: "full",
+        addedCommitCount: commits.length,
+        removedCommitCount: 0,
+        commits
+      } satisfies CommitCacheFile;
+    }
+    const orderedShas = await this.commitOrder(repositoryPath);
+    const existingBySha = new Map(baseline.commits.map((commit) => [commit.sha, commit]));
+    const missingShas = orderedShas.filter((sha) => !existingBySha.has(sha));
+    const orderedShaSet = new Set(orderedShas);
+    const removedCommitCount = baseline.commits
+      .reduce((count, commit) => count + (orderedShaSet.has(commit.sha) ? 0 : 1), 0);
+    const useIncremental = missingShas.length <= INCREMENTAL_COMMIT_LIMIT;
+    let commits: CachedGitCommit[];
+    let refreshMode: CommitCacheFile["refreshMode"] = "full";
+
+    if (useIncremental) {
+      const additions = await this.loadMissingCommitMetadata(repositoryPath, missingShas);
+      additions.forEach((commit) => existingBySha.set(commit.sha, commit));
+      const complete = missingShas.every((sha) => existingBySha.has(sha));
+      if (complete) {
+        commits = orderedShas.map((sha) => existingBySha.get(sha)!);
+        refreshMode = "incremental";
+      } else {
+        commits = [];
+      }
+    } else {
+      commits = [];
+    }
+
+    if (commits.length !== orderedShas.length) {
+      const output = await this.command(repositoryPath, [
+        "log",
+        "--all",
+        "--topo-order",
+        "--format=%H%x00%h%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00%D"
+      ], 300_000, COMMIT_CACHE_OUTPUT_LIMIT);
+      commits = this.parseCommitLog(output);
+      refreshMode = "full";
+    }
+
+    const refsBySha = await this.commitRefs(repositoryPath);
+    commits = commits.map((commit) => ({ ...commit, refs: refsBySha.get(commit.sha) ?? [] }));
+    return {
+      schemaVersion: COMMIT_CACHE_SCHEMA_VERSION,
+      repositoryPath,
+      fingerprint,
+      generatedAt: new Date().toISOString(),
+      syncedAt: baseline?.syncedAt,
+      refreshMode,
+      addedCommitCount: missingShas.length,
+      removedCommitCount,
+      commits
+    } satisfies CommitCacheFile;
   }
 
   private async writeCommitCache(filePath: string, cache: CommitCacheFile) {
@@ -266,7 +549,11 @@ export class GitRepositoryService {
     const repositoryPath = project.localRepositoryPath;
     const fingerprint = await this.commitFingerprint(repositoryPath);
     const inMemory = this.memoryCommitCaches.get(project.id);
-    if (inMemory?.fingerprint === fingerprint && inMemory.repositoryPath === repositoryPath) {
+    if (inMemory) this.rememberCommitCache(project.id, inMemory);
+    if (
+      inMemory?.fingerprint === fingerprint &&
+      sameRepositoryPath(inMemory.repositoryPath, repositoryPath)
+    ) {
       return { cache: inMemory, refreshed: false };
     }
 
@@ -276,37 +563,16 @@ export class GitRepositoryService {
 
     const loading = (async () => {
       const filePath = this.commitCacheFile(project);
-      try {
-        const fromDisk = JSON.parse(await readFile(filePath, "utf8")) as unknown;
-        if (
-          this.validCommitCache(fromDisk) &&
-          fromDisk.fingerprint === fingerprint &&
-          fromDisk.repositoryPath === repositoryPath
-        ) {
-          this.memoryCommitCaches.set(project.id, fromDisk);
-          return { cache: fromDisk, refreshed: false };
-        }
-      } catch (error) {
-        if (!(["ENOENT", "SyntaxError"] as string[]).includes((error as NodeJS.ErrnoException).code ?? (error as Error).name)) {
-          throw error;
-        }
+      const fromDisk = inMemory && sameRepositoryPath(inMemory.repositoryPath, repositoryPath)
+        ? inMemory
+        : await this.readCommitCache(project);
+      if (fromDisk?.fingerprint === fingerprint) {
+        this.rememberCommitCache(project.id, fromDisk);
+        return { cache: fromDisk, refreshed: false };
       }
-
-      const output = await this.command(repositoryPath, [
-        "log",
-        "--all",
-        "--topo-order",
-        "--format=%H%x00%h%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00%D"
-      ], 120_000, COMMIT_CACHE_OUTPUT_LIMIT);
-      const cache: CommitCacheFile = {
-        schemaVersion: COMMIT_CACHE_SCHEMA_VERSION,
-        repositoryPath,
-        fingerprint,
-        generatedAt: new Date().toISOString(),
-        commits: this.parseCommitLog(output)
-      };
+      const cache = await this.rebuildCommitCache(project, fingerprint, fromDisk);
       await this.writeCommitCache(filePath, cache);
-      this.memoryCommitCaches.set(project.id, cache);
+      this.rememberCommitCache(project.id, cache);
       return { cache, refreshed: true };
     })();
 
@@ -344,7 +610,7 @@ export class GitRepositoryService {
       OUTPUT_LIMIT,
       access.environment
     );
-    const fetchArgs = ["fetch", "--prune", "--tags"];
+    const fetchArgs = ["fetch", "--prune", "--tags", "--no-recurse-submodules", "--no-write-fetch-head"];
     if (options.cloneDepth > 0) fetchArgs.push("--depth", String(options.cloneDepth));
     fetchArgs.push("origin", "+refs/heads/*:refs/remotes/origin/*");
     await this.command(
@@ -354,10 +620,14 @@ export class GitRepositoryService {
       OUTPUT_LIMIT,
       access.environment
     );
+    this.repositoryStatusCaches.delete(project.id);
+    this.repositoryValidations.delete(project.id);
+    this.branchCaches.delete(project.id);
     const { cache } = await this.loadCommitCache(project);
     const completedAt = new Date().toISOString();
     cache.syncedAt = completedAt;
-    await this.writeCommitCache(this.commitCacheFile(project), cache);
+    await mkdir(this.commitCacheRoot, { recursive: true });
+    await writeFile(this.commitCacheMetadataFile(project), JSON.stringify({ syncedAt: completedAt }), "utf8");
     return {
       startedAt,
       completedAt,
@@ -441,8 +711,11 @@ export class GitRepositoryService {
     });
   }
 
-  private reachableCommits(commits: CachedGitCommit[], headSha: string) {
-    const commitsBySha = new Map(commits.map((commit) => [commit.sha, commit]));
+  private reachableCommits(
+    commits: CachedGitCommit[],
+    headSha: string,
+    commitsBySha = new Map(commits.map((commit) => [commit.sha, commit]))
+  ) {
     const reachable = new Set<string>();
     const pending = [headSha];
     while (pending.length > 0) {
@@ -454,8 +727,57 @@ export class GitRepositoryService {
     return commits.filter((commit) => reachable.has(commit.sha));
   }
 
+  private commitAuthors(commits: CachedGitCommit[]) {
+    const authorsByIdentity = new Map<string, { name: string; email: string; commitCount: number }>();
+    commits.forEach((commit) => {
+      const key = `${commit.authorName.trim().toLowerCase()}\0${commit.authorEmail.trim().toLowerCase()}`;
+      const author = authorsByIdentity.get(key);
+      if (author) author.commitCount += 1;
+      else authorsByIdentity.set(key, {
+        name: commit.authorName,
+        email: commit.authorEmail,
+        commitCount: 1
+      });
+    });
+    return [...authorsByIdentity.values()].sort((a, b) =>
+      b.commitCount - a.commitCount || a.name.localeCompare(b.name, "zh-CN")
+    );
+  }
+
+  private commitScope(cache: CommitCacheFile, headSha?: string) {
+    let derived = this.derivedCommitCaches.get(cache);
+    if (!derived) {
+      derived = {
+        commitsBySha: new Map(cache.commits.map((commit) => [commit.sha, commit])),
+        scopes: new Map()
+      };
+      this.derivedCommitCaches.set(cache, derived);
+    }
+    const scopeKey = headSha ?? "*";
+    const cachedScope = derived.scopes.get(scopeKey);
+    if (cachedScope) return cachedScope;
+    const commits = headSha
+      ? this.reachableCommits(cache.commits, headSha, derived.commitsBySha)
+      : cache.commits;
+    const scope = { commits, authors: this.commitAuthors(commits) };
+    if (derived.scopes.size >= MAX_DERIVED_BRANCH_SCOPES) {
+      const oldestBranchScope = [...derived.scopes.keys()].find((key) => key !== "*");
+      if (oldestBranchScope) derived.scopes.delete(oldestBranchScope);
+    }
+    derived.scopes.set(scopeKey, scope);
+    return scope;
+  }
+
   async branches(project: ReviewProject): Promise<GitBranchSummary[]> {
     const status = await this.assertRepository(project);
+    const cached = this.branchCaches.get(project.id);
+    if (
+      cached &&
+      cached.expiresAt > Date.now() &&
+      cached.repositoryPath === project.localRepositoryPath
+    ) {
+      return cached.items;
+    }
     const output = await this.command(project.localRepositoryPath, [
       "for-each-ref",
       "--sort=-authordate",
@@ -481,7 +803,13 @@ export class GitRepositoryService {
         remote
       });
     }
-    return [...byName.values()].sort((a, b) => b.authoredAt.localeCompare(a.authoredAt));
+    const items = [...byName.values()].sort((a, b) => b.authoredAt.localeCompare(a.authoredAt));
+    this.branchCaches.set(project.id, {
+      repositoryPath: project.localRepositoryPath,
+      expiresAt: Date.now() + BRANCH_CACHE_TTL_MS,
+      items
+    });
+    return items;
   }
 
   async commits(project: ReviewProject, query: {
@@ -495,27 +823,12 @@ export class GitRepositoryService {
   }): Promise<GitCommitPage> {
     await this.assertRepository(project);
     const { cache, refreshed } = await this.loadCommitCache(project);
-    let scopedCommits = cache.commits;
+    let branchHead: string | undefined;
     if (query.branch) {
       const resolved = await this.resolveBranch(project.localRepositoryPath, query.branch);
-      const branchHead = await this.command(project.localRepositoryPath, ["rev-parse", resolved]);
-      scopedCommits = this.reachableCommits(cache.commits, branchHead);
+      branchHead = await this.command(project.localRepositoryPath, ["rev-parse", resolved]);
     }
-
-    const authorsByIdentity = new Map<string, { name: string; email: string; commitCount: number }>();
-    scopedCommits.forEach((commit) => {
-      const key = `${commit.authorName.trim().toLowerCase()}\0${commit.authorEmail.trim().toLowerCase()}`;
-      const author = authorsByIdentity.get(key);
-      if (author) author.commitCount += 1;
-      else authorsByIdentity.set(key, {
-        name: commit.authorName,
-        email: commit.authorEmail,
-        commitCount: 1
-      });
-    });
-    const authors = [...authorsByIdentity.values()].sort((a, b) =>
-      b.commitCount - a.commitCount || a.name.localeCompare(b.name, "zh-CN")
-    );
+    const { commits: scopedCommits, authors } = this.commitScope(cache, branchHead);
 
     let filteredCommits = scopedCommits;
     if (query.search) {

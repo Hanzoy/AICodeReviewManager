@@ -949,6 +949,7 @@ function ProjectDetailPage({
   const [resultTask, setResultTask] = useState<ReviewTask>();
   const [manualPanelTab, setManualPanelTab] = useState<"create" | "history">(focusTaskId ? "history" : "create");
   const handledFocusTask = useRef<string | undefined>(undefined);
+  const commitRequestSequence = useRef(0);
   const { message } = AntApp.useApp();
 
   const loadProject = useCallback(async () => {
@@ -979,9 +980,10 @@ function ProjectDetailPage({
 
   const loadCommits = useCallback(async () => {
     if (!repositoryStatus?.valid) return;
+    const requestSequence = ++commitRequestSequence.current;
     setCommitLoading(true);
     try {
-      setCommitPage(await managerApi.repositoryCommits(groupId, projectId, {
+      const result = await managerApi.repositoryCommits(groupId, projectId, {
         branch: branchFilter,
         search,
         author: authorFilter,
@@ -989,11 +991,14 @@ function ProjectDetailPage({
         until,
         page,
         pageSize
-      }));
+      });
+      if (requestSequence === commitRequestSequence.current) setCommitPage(result);
     } catch (caught) {
-      message.error(caught instanceof Error ? caught.message : "Commit 历史加载失败");
+      if (requestSequence === commitRequestSequence.current) {
+        message.error(caught instanceof Error ? caught.message : "Commit 历史加载失败");
+      }
     } finally {
-      setCommitLoading(false);
+      if (requestSequence === commitRequestSequence.current) setCommitLoading(false);
     }
   }, [authorFilter, branchFilter, groupId, message, page, pageSize, projectId, repositoryStatus?.valid, search, since, until]);
 
