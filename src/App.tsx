@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -52,6 +52,8 @@ import type {
   ProjectGroupSummary
 } from "../shared/contracts";
 import { managerApi } from "./api";
+import { commandWithFrontendHostname, frontendHostPort, withFrontendHostname } from "./frontendAddress";
+import { useVisiblePolling } from "./useVisiblePolling";
 import { GroupWorkspace, type WorkspacePage } from "./GroupWorkspace";
 
 const { Header, Sider, Content } = Layout;
@@ -132,8 +134,14 @@ export default function App() {
   const [creating, setCreating] = useState(false);
   const [enrollment, setEnrollment] = useState<EnrollmentResult>();
   const [selectedGroup, setSelectedGroup] = useState<ProjectGroupSummary>();
+  const loadInFlight = useRef<Promise<void> | undefined>(undefined);
+  const runtimeLoaded = useRef(false);
   const [form] = Form.useForm();
   const { message } = AntApp.useApp();
+  const displayedManagerUrl = runtime ? withFrontendHostname(runtime.publicUrl) : undefined;
+  const displayedStartCommand = enrollment
+    ? commandWithFrontendHostname(enrollment.startCommand)
+    : undefined;
 
   const navigateToManager = useCallback(() => {
     window.history.pushState(null, "", "/");
@@ -151,31 +159,47 @@ export default function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  const load = useCallback(async (quiet = false) => {
+  const load = useCallback((quiet = false, refreshRuntime = false) => {
+    if (loadInFlight.current) return loadInFlight.current;
     if (!quiet) setLoading(true);
-    try {
-      const [runtimeResult, groupResult] = await Promise.all([
-        managerApi.runtime(),
-        managerApi.groups()
-      ]);
-      setRuntime(runtimeResult);
-      setGroups(groupResult);
-      setLoadError(undefined);
-      setSelectedGroup((current) =>
-        current ? groupResult.find((group) => group.id === current.id) : undefined
-      );
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : "无法连接总管理端");
-    } finally {
-      setLoading(false);
-    }
+    const operation = (async () => {
+      try {
+        const shouldLoadRuntime = refreshRuntime || !runtimeLoaded.current;
+        const [runtimeResult, groupResult] = await Promise.all([
+          shouldLoadRuntime ? managerApi.runtime() : Promise.resolve(undefined),
+          managerApi.groups()
+        ]);
+        if (runtimeResult) {
+          runtimeLoaded.current = true;
+          setRuntime(runtimeResult);
+        }
+        setGroups(groupResult);
+        setLoadError(undefined);
+        setSelectedGroup((current) =>
+          current ? groupResult.find((group) => group.id === current.id) : undefined
+        );
+      } catch (error) {
+        setLoadError(error instanceof Error ? error.message : "无法连接总管理端");
+      } finally {
+        setLoading(false);
+      }
+    })();
+    loadInFlight.current = operation;
+    void operation.finally(() => {
+      if (loadInFlight.current === operation) loadInFlight.current = undefined;
+    });
+    return operation;
   }, []);
 
   useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => void load(true), 5_000);
-    return () => window.clearInterval(timer);
+    void load(false, true);
   }, [load]);
+
+  useVisiblePolling(
+    () => load(true),
+    15_000,
+    { enabled: route.kind === "manager", runImmediately: true }
+  );
 
   const createGroup = async () => {
     const values = await form.validateFields();
@@ -249,7 +273,7 @@ export default function App() {
         title: "节点地址",
         key: "endpoint",
         render: (_value, group) =>
-          group.node ? <Text code>{group.node.host}:{group.node.port}</Text> : <Text type="secondary">—</Text>
+          group.node ? <Text code>{frontendHostPort(group.node.host, group.node.port)}</Text> : <Text type="secondary">—</Text>
       },
       {
         title: "版本",
@@ -344,7 +368,7 @@ export default function App() {
           <Space size={16}>
             <Badge status={loadError ? "error" : "success"} text={loadError ? "连接异常" : "服务正常"} />
             <Tooltip title="刷新">
-              <Button icon={<ReloadOutlined />} onClick={() => void load()} loading={loading} />
+              <Button icon={<ReloadOutlined />} onClick={() => void load(false, true)} loading={loading} />
             </Tooltip>
           </Space>
         </Header>
@@ -381,12 +405,12 @@ export default function App() {
                     <div>
                       <Text strong>节点注册地址</Text>
                       <div className="registry-url">
-                        <Text code>{runtime?.publicUrl ?? "正在读取…"}</Text>
-                        {runtime ? (
+                        <Text code>{displayedManagerUrl ?? "正在读取…"}</Text>
+                        {displayedManagerUrl ? (
                           <Button
                             type="text"
                             icon={<CopyOutlined />}
-                            onClick={() => void copy(runtime.publicUrl, "管理端地址")}
+                            onClick={() => void copy(displayedManagerUrl, "管理端地址")}
                           />
                         ) : null}
                       </div>
@@ -478,8 +502,8 @@ export default function App() {
             <div>
               <Text strong>启动命令</Text>
               <div className="command-box">
-                <code>{enrollment.startCommand}</code>
-                <Button icon={<CopyOutlined />} onClick={() => void copy(enrollment.startCommand, "启动命令")}>
+                <code>{displayedStartCommand}</code>
+                <Button icon={<CopyOutlined />} onClick={() => void copy(displayedStartCommand ?? "", "启动命令")}>
                   复制
                 </Button>
               </div>
@@ -543,7 +567,7 @@ function NodePage({
                 </Flex>
                 <Descriptions size="small" column={1} className="node-descriptions">
                   <Descriptions.Item label="节点地址">
-                    {group.node ? `${group.node.host}:${group.node.port}` : "尚未注册"}
+                    {group.node ? frontendHostPort(group.node.host, group.node.port) : "尚未注册"}
                   </Descriptions.Item>
                   <Descriptions.Item label="节点版本">{group.node?.version ?? "—"}</Descriptions.Item>
                   <Descriptions.Item label="最近心跳">{formatTime(group.node?.lastHeartbeatAt)}</Descriptions.Item>
@@ -580,8 +604,8 @@ function SystemPage({ runtime }: { runtime?: ManagerRuntimeInfo }) {
             <Descriptions column={1} labelStyle={{ width: 140 }}>
               <Descriptions.Item label="服务名称">{runtime?.name ?? "—"}</Descriptions.Item>
               <Descriptions.Item label="版本">{runtime?.version ?? "—"}</Descriptions.Item>
-              <Descriptions.Item label="公开地址"><Text code>{runtime?.publicUrl ?? "—"}</Text></Descriptions.Item>
-              <Descriptions.Item label="节点注册接口"><Text code>{runtime?.registrationUrl ?? "—"}</Text></Descriptions.Item>
+              <Descriptions.Item label="公开地址"><Text code>{runtime ? withFrontendHostname(runtime.publicUrl) : "—"}</Text></Descriptions.Item>
+              <Descriptions.Item label="节点注册接口"><Text code>{runtime ? withFrontendHostname(runtime.registrationUrl) : "—"}</Text></Descriptions.Item>
               <Descriptions.Item label="启动时间">{formatTime(runtime?.startedAt)}</Descriptions.Item>
             </Descriptions>
           </Card>
@@ -695,7 +719,7 @@ function GroupDrawer({
           {group.node ? (
             <Descriptions column={1} size="small">
               <Descriptions.Item label="节点 ID"><Text code>{group.node.id.slice(0, 12)}…</Text></Descriptions.Item>
-              <Descriptions.Item label="本地地址"><Text code>{group.node.baseUrl}</Text></Descriptions.Item>
+              <Descriptions.Item label="节点地址"><Text code>{withFrontendHostname(group.node.baseUrl)}</Text></Descriptions.Item>
               <Descriptions.Item label="版本">{group.node.version}</Descriptions.Item>
               <Descriptions.Item label="最近心跳">{formatTime(group.node.lastHeartbeatAt)}</Descriptions.Item>
             </Descriptions>

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type { ReviewResult } from "../shared/contracts.js";
@@ -12,6 +12,7 @@ import {
 } from "../server/group/feishu-notifier.js";
 import { ProjectStore } from "../server/group/project-store.js";
 import { GitRepositoryService } from "../server/group/git-repository.js";
+import { GitOperationCoordinator } from "../server/group/git-operation-coordinator.js";
 import {
   ReviewWorker,
   REVIEW_OUTPUT_JSON_SCHEMA,
@@ -113,9 +114,14 @@ try {
     fakeReviewCli,
     [
       "if (process.argv.includes('--json-schema')) {",
+      "  const { readFileSync } = await import('node:fs');",
+      "  const prompt = readFileSync(0, 'utf8');",
+      "  const allowedTools = process.argv[process.argv.indexOf('--allowedTools') + 1] || '';",
       "  const expected = { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_AUTH_TOKEN: 'deepseek-integration-test-key', ANTHROPIC_MODEL: 'deepseek-test-model', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-flash', CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash' };",
       "  for (const [name, value] of Object.entries(expected)) { if (process.env[name] !== value) { console.error(`invalid ${name}`); process.exit(3); } }",
       "  if (!process.argv.includes('--safe-mode') || !process.argv.includes('--no-session-persistence')) { console.error('Review safety flags are missing'); process.exit(4); }",
+      "  if (!process.argv.includes('--add-dir') || !prompt.includes('<prepared_diff>')) { console.error('Prepared diff was not exposed to the Review runtime'); process.exit(5); }",
+      "  if (allowedTools.includes(':*') || !allowedTools.includes('Bash(git --no-pager show *)')) { console.error('Read-only Git tool patterns are invalid'); process.exit(6); }",
       "  const result = { verdict: 'comment', riskLevel: 'medium', summary: '发现一个可验证的问题。', findings: [{ severity: 'medium', title: '示例问题', file: 'sample.ts', line: 1, description: '测试 Review Worker 的结构化结果。', suggestion: '修正示例实现。' }], positives: ['输出格式正确'] };",
       "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, structured_output: result }));",
       "  process.exit(0);",
@@ -206,6 +212,13 @@ try {
   if (!postedComment.includes(reviewMarker(task)) || !postedComment.includes("sample.ts:1")) {
     throw new Error("GitLab comment did not contain the expected Review marker and finding");
   }
+  const preparedDiff = await readFile(
+    path.join(groupData, "review-artifacts", task.id, "review-input.patch"),
+    "utf8"
+  );
+  if (!preparedDiff.includes("sample.ts") || !preparedDiff.includes("export const value = 2")) {
+    throw new Error("Review Worker did not prepare the actual Git diff before invoking AI");
+  }
   if (!postedComment.includes("DeepSeek 自动 Code Review") || /claude/i.test(postedComment)) {
     throw new Error("GitLab comment exposed an unexpected Review runtime implementation detail");
   }
@@ -241,12 +254,86 @@ try {
     throw new Error("Failed Review notification content is incomplete");
   }
 
-  const gitRepository = new GitRepositoryService();
+  const gitRepository = new GitRepositoryService(path.join(root, "commit-cache"));
   const repositoryStatus = await gitRepository.status(credentials.project);
   const branches = await gitRepository.branches(credentials.project);
   const commits = await gitRepository.commits(credentials.project, { page: 1, pageSize: 20 });
   if (!repositoryStatus.valid || !branches.some((branch) => branch.name === "main") || commits.items.length < 1) {
     throw new Error("Manual Review repository browsing did not return the expected Git data");
+  }
+  await command("git", ["push", "origin", "HEAD:refs/heads/sync-test"], seedRepository);
+  const syncResult = await gitRepository.sync(credentials.project, {
+    cloneDepth: 0,
+    requestTimeoutSeconds: 30,
+    gitlabToken: "integration-test-token",
+    gitlabConfig: workerConfig.gitlab
+  });
+  const commitsAfterSync = await gitRepository.commits(credentials.project, { page: 1, pageSize: 20 });
+  if (!syncResult.changed || !commitsAfterSync.cache.syncedAt || commitsAfterSync.cache.commitCount < commits.items.length) {
+    throw new Error("Repository sync did not fetch remote branches and warm the Commit cache");
+  }
+
+  const coordinator = new GitOperationCoordinator();
+  const operationOrder: string[] = [];
+  const firstOperation = coordinator.run("shared-project", async () => {
+    operationOrder.push("first-start");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    operationOrder.push("first-end");
+  });
+  const secondOperation = coordinator.run("shared-project", async () => {
+    operationOrder.push("second-start");
+    operationOrder.push("second-end");
+  });
+  await Promise.all([firstOperation, secondOperation]);
+  if (operationOrder.join(",") !== "first-start,first-end,second-start,second-end") {
+    throw new Error("Git operations for the same project were not serialized");
+  }
+
+  const graphRepositoryPath = path.join(root, "graph-repository");
+  await mkdir(graphRepositoryPath, { recursive: true });
+  await command("git", ["init", "--initial-branch=main"], graphRepositoryPath);
+  await command("git", ["config", "user.name", "Main Author"], graphRepositoryPath);
+  await command("git", ["config", "user.email", "main@example.com"], graphRepositoryPath);
+  await writeFile(path.join(graphRepositoryPath, "base.txt"), "base\n", "utf8");
+  await command("git", ["add", "."], graphRepositoryPath);
+  await command("git", ["commit", "-m", "graph base"], graphRepositoryPath);
+  await command("git", ["checkout", "-b", "feature/cache"], graphRepositoryPath);
+  await command("git", ["config", "user.name", "Branch Author"], graphRepositoryPath);
+  await command("git", ["config", "user.email", "branch@example.com"], graphRepositoryPath);
+  await writeFile(path.join(graphRepositoryPath, "feature.txt"), "feature\n", "utf8");
+  await command("git", ["add", "."], graphRepositoryPath);
+  await command("git", ["commit", "-m", "feature branch commit"], graphRepositoryPath);
+  await command("git", ["checkout", "main"], graphRepositoryPath);
+  await command("git", ["config", "user.name", "Main Author"], graphRepositoryPath);
+  await command("git", ["config", "user.email", "main@example.com"], graphRepositoryPath);
+  await writeFile(path.join(graphRepositoryPath, "main.txt"), "main\n", "utf8");
+  await command("git", ["add", "."], graphRepositoryPath);
+  await command("git", ["commit", "-m", "main branch commit"], graphRepositoryPath);
+  await command("git", ["merge", "--no-ff", "feature/cache", "-m", "merge feature cache"], graphRepositoryPath);
+
+  const graphProject = {
+    ...credentials.project,
+    id: "graph-project",
+    key: "graph_project",
+    name: "Graph Project",
+    repositoryUrl: graphRepositoryPath,
+    localRepositoryPath: graphRepositoryPath
+  };
+  const graphCommits = await gitRepository.commits(graphProject, { page: 1, pageSize: 20 });
+  const cachedGraphCommits = await gitRepository.commits(graphProject, { page: 1, pageSize: 20 });
+  const authorCommits = await gitRepository.commits(graphProject, {
+    author: "Branch Author <branch@example.com>",
+    page: 1,
+    pageSize: 20
+  });
+  if (
+    !graphCommits.cache.refreshed ||
+    cachedGraphCommits.cache.refreshed ||
+    !graphCommits.items.some((commit) => commit.parentShas.length > 1 && commit.graph.laneCount > 1) ||
+    authorCommits.total !== 1 ||
+    authorCommits.items[0]?.authorName !== "Branch Author"
+  ) {
+    throw new Error("Commit graph cache, branch topology, or author filtering is incorrect");
   }
   const manualPreview = await gitRepository.preview(credentials.project, {
     mode: "commits",

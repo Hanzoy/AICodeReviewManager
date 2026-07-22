@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdir, stat, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type {
@@ -9,6 +10,8 @@ import type {
   ReviewTask
 } from "../../shared/contracts.js";
 import type { GroupConfigStore } from "./config-store.js";
+import { resolveGitRepositoryAccess } from "./git-auth.js";
+import { GitOperationCoordinator } from "./git-operation-coordinator.js";
 import {
   sendCriticalFindingNotification,
   sendManualReviewCompletedNotification,
@@ -89,6 +92,13 @@ interface GitLabNote {
 }
 
 const OUTPUT_LIMIT = 512 * 1024;
+const MAX_REVIEW_CONTEXT_BYTES = 64 * 1024 * 1024;
+
+interface ReviewInputContext {
+  filePath: string;
+  byteLength: number;
+  truncated: boolean;
+}
 
 function appendLimited(current: string, chunk: Buffer | string) {
   const next = current + chunk.toString();
@@ -145,8 +155,23 @@ export async function resolveReviewRuntimeInvocation(configuredCommand: string) 
   return { command, argsPrefix: [] as string[] };
 }
 
-export function buildReviewPrompt(task: ReviewTask, config: GroupNodeConfig) {
+export function buildReviewPrompt(
+  task: ReviewTask,
+  config: GroupNodeConfig,
+  reviewInput?: ReviewInputContext
+) {
   const language = config.general.reviewLanguage === "en-US" ? "English" : "简体中文";
+  const inputInstruction = reviewInput ? [
+    "",
+    "<prepared_diff>",
+    `Path: ${reviewInput.filePath}`,
+    `Bytes: ${reviewInput.byteLength}`,
+    `Truncated: ${reviewInput.truncated ? "yes" : "no"}`,
+    "应用程序已经生成本次审查范围的真实 Git Patch。必须优先使用 Read/Grep 分段读取该文件，再结合仓库源码进行审查。",
+    "当前工作目录已经是目标 Git 仓库；如需补充 Git 信息，只能直接运行白名单内的 git 命令，不要使用 cd、&&、git -C 或 shell 包装。",
+    "不得以 Bash 权限、无法执行 Git 或缺少 diff 为由跳过审查。",
+    "</prepared_diff>"
+  ] : [];
   if (task.triggerType === "manual" && task.manualSelection) {
     const selection = task.manualSelection;
     const scopeInstruction = selection.mode === "branch"
@@ -168,6 +193,7 @@ export function buildReviewPrompt(task: ReviewTask, config: GroupNodeConfig) {
       ...(selection.branch ? [`Source branch: ${selection.branch}`] : []),
       `Comment language: ${language}`,
       "</review_context>",
+      ...inputInstruction,
       "",
       scopeInstruction,
       "最终响应只允许包含 JSON Schema 要求的对象。"
@@ -184,6 +210,7 @@ export function buildReviewPrompt(task: ReviewTask, config: GroupNodeConfig) {
     `Head SHA: ${task.headSha}`,
     `Comment language: ${language}`,
     "</review_context>",
+    ...inputInstruction,
     "",
     `使用 Git 检查 \`origin/${task.targetBranch}\` 与当前 HEAD 的 merge-base，并将审查范围严格限定为该 merge-base 到 HEAD 的差异。`,
     "最终响应只允许包含 JSON Schema 要求的对象。"
@@ -307,7 +334,8 @@ export class ReviewWorker {
     private readonly dataDir: string,
     private readonly projectStore: ProjectStore,
     private readonly configStore: GroupConfigStore,
-    private readonly logger: WorkerLogger
+    private readonly logger: WorkerLogger,
+    private readonly gitCoordinator = new GitOperationCoordinator()
   ) {
     this.schemaPath = path.resolve(dataDir, "review-output-schema.json");
   }
@@ -367,8 +395,10 @@ export class ReviewWorker {
     try {
       const project = await this.projectStore.getProject(task.projectId, config.repository.rootPath);
       if (!project.enabled) throw new Error("项目已停用，无法执行 Review");
-      const repositoryPath = await this.prepareRepository(project, task, config, gitlabToken);
-      const result = await this.runDeepSeekReview(repositoryPath, task, config, aiApiKey);
+      const result = await this.gitCoordinator.run(project.id, async () => {
+        const repositoryPath = await this.prepareRepository(project, task, config, gitlabToken);
+        return this.runDeepSeekReview(repositoryPath, task, config, aiApiKey);
+      });
       if (!(await this.projectStore.canPublishTask(task.id))) {
         this.logger.info({ taskId: task.id }, "Review result skipped because a newer MR version exists");
         return true;
@@ -467,7 +497,14 @@ export class ReviewWorker {
   ) {
     const repositoryPath = project.localRepositoryPath;
     const gitDirectory = path.join(repositoryPath, ".git");
-    const gitEnvironment = await this.gitEnvironment(project.repositoryUrl, gitlabToken);
+    const access = await resolveGitRepositoryAccess({
+      dataDir: this.dataDir,
+      configuredRepositoryUrl: project.repositoryUrl,
+      gitlabProjectRef: project.gitlabProjectRef,
+      gitlabConfig: config.gitlab,
+      gitlabToken
+    });
+    const { environment, repositoryUrl } = access;
     let repositoryExists = false;
     try {
       repositoryExists = (await stat(gitDirectory)).isDirectory();
@@ -487,26 +524,26 @@ export class ReviewWorker {
       if (config.repository.cloneDepth > 0) {
         cloneArgs.push("--depth", String(config.repository.cloneDepth));
       }
-      cloneArgs.push(project.repositoryUrl, repositoryPath);
+      cloneArgs.push(repositoryUrl, repositoryPath);
       await this.runCommand("git", cloneArgs, {
         cwd: path.dirname(repositoryPath),
-        env: gitEnvironment,
+        env: environment,
         timeoutMs: config.gitlab.requestTimeoutSeconds * 1000 * 10
       });
     }
 
     const status = await this.runCommand("git", ["status", "--porcelain"], {
       cwd: repositoryPath,
-      env: gitEnvironment,
+      env: environment,
       timeoutMs: 30_000
     });
     if (status.stdout.trim()) {
       throw new Error(`仓库存在未提交修改，已停止自动切换分支：${repositoryPath}`);
     }
 
-    await this.runCommand("git", ["remote", "set-url", "origin", project.repositoryUrl], {
+    await this.runCommand("git", ["remote", "set-url", "origin", repositoryUrl], {
       cwd: repositoryPath,
-      env: gitEnvironment,
+      env: environment,
       timeoutMs: 30_000
     });
     const fetchArgs = ["fetch", "--prune", "origin"];
@@ -525,7 +562,7 @@ export class ReviewWorker {
     }
     await this.runCommand("git", fetchArgs, {
       cwd: repositoryPath,
-      env: gitEnvironment,
+      env: environment,
       timeoutMs: config.gitlab.requestTimeoutSeconds * 1000 * 10
     });
 
@@ -537,13 +574,13 @@ export class ReviewWorker {
       for (const sha of task.manualSelection.commitShas) {
         await this.runCommand("git", ["rev-parse", "--verify", `${sha}^{commit}`], {
           cwd: repositoryPath,
-          env: gitEnvironment,
+          env: environment,
           timeoutMs: 30_000
         });
       }
       await this.runCommand("git", ["checkout", "--detach", checkoutRef], {
         cwd: repositoryPath,
-        env: gitEnvironment,
+        env: environment,
         timeoutMs: 120_000
       });
       return repositoryPath;
@@ -552,7 +589,7 @@ export class ReviewWorker {
     const mrRef = `refs/remotes/origin/merge-requests/${task.mergeRequestIid}/head`;
     const fetchedHead = await this.runCommand("git", ["rev-parse", mrRef], {
       cwd: repositoryPath,
-      env: gitEnvironment,
+      env: environment,
       timeoutMs: 30_000
     });
     if (fetchedHead.stdout.trim().toLowerCase() !== task.headSha.toLowerCase()) {
@@ -560,29 +597,10 @@ export class ReviewWorker {
     }
     await this.runCommand("git", ["checkout", "--detach", mrRef], {
       cwd: repositoryPath,
-      env: gitEnvironment,
+      env: environment,
       timeoutMs: 120_000
     });
     return repositoryPath;
-  }
-
-  private async gitEnvironment(repositoryUrl: string, gitlabToken: string) {
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      GCM_INTERACTIVE: "Never"
-    };
-    if (!/^https?:\/\//i.test(repositoryUrl)) return env;
-
-    const askPassPath = path.resolve(this.dataDir, process.platform === "win32" ? "git-askpass.cmd" : "git-askpass.sh");
-    const script = process.platform === "win32"
-      ? "@echo off\r\necho %~1 | findstr /I \"Username\" >nul\r\nif %errorlevel%==0 (echo oauth2) else (echo %CODE_REVIEW_GITLAB_TOKEN%)\r\n"
-      : "#!/bin/sh\ncase \"$1\" in *Username*) printf '%s\\n' oauth2 ;; *) printf '%s\\n' \"$CODE_REVIEW_GITLAB_TOKEN\" ;; esac\n";
-    await writeFile(askPassPath, script, { encoding: "utf8", mode: 0o700 });
-    if (process.platform !== "win32") await chmod(askPassPath, 0o700);
-    env.GIT_ASKPASS = askPassPath;
-    env.CODE_REVIEW_GITLAB_TOKEN = gitlabToken;
-    return env;
   }
 
   private async runDeepSeekReview(
@@ -593,6 +611,7 @@ export class ReviewWorker {
   ) {
     const artifactDirectory = path.resolve(this.dataDir, "review-artifacts", task.id);
     await mkdir(artifactDirectory, { recursive: true });
+    const reviewInput = await this.prepareReviewInput(repositoryPath, artifactDirectory, task);
 
     const args = [
       "--print",
@@ -602,20 +621,25 @@ export class ReviewWorker {
       "--permission-mode", "dontAsk",
       "--no-session-persistence",
       "--safe-mode",
+      "--add-dir", artifactDirectory,
       "--tools", "Read,Glob,Grep,Bash,Agent",
       "--allowedTools", [
         "Read",
         "Glob",
         "Grep",
         "Agent",
-        "Bash(git status:*)",
-        "Bash(git diff:*)",
-        "Bash(git show:*)",
-        "Bash(git log:*)",
-        "Bash(git merge-base:*)",
-        "Bash(git rev-parse:*)",
-        "Bash(git ls-files:*)",
-        "Bash(git blame:*)"
+        "Bash(git status)",
+        "Bash(git status *)",
+        "Bash(git diff *)",
+        "Bash(git show *)",
+        "Bash(git log *)",
+        "Bash(git merge-base *)",
+        "Bash(git rev-parse *)",
+        "Bash(git ls-files *)",
+        "Bash(git blame *)",
+        "Bash(git --no-pager diff *)",
+        "Bash(git --no-pager show *)",
+        "Bash(git --no-pager log *)"
       ].join(","),
       "--disallowedTools", "Edit,Write,NotebookEdit,WebFetch,WebSearch",
       "--effort", config.ai.reasoningEffort
@@ -629,7 +653,7 @@ export class ReviewWorker {
       commandResult = await this.runCommand(invocation.command, [...invocation.argsPrefix, ...args], {
         cwd: repositoryPath,
         env: deepSeekEnvironment(config, apiKey),
-        input: buildReviewPrompt(task, config),
+        input: buildReviewPrompt(task, config, reviewInput),
         timeoutMs: config.ai.requestTimeoutSeconds * 1000
       });
     } catch (error) {
@@ -650,8 +674,162 @@ export class ReviewWorker {
       writeFile(path.join(artifactDirectory, "deepseek.stderr.log"), commandResult.stderr, "utf8")
     ]);
     const result = parseReviewRuntimeOutput(commandResult.stdout);
+    if (
+      result.findings.length === 0 &&
+      /(?:无法|不能|未能).{0,40}(?:获取|读取|访问).{0,40}(?:diff|patch|差异)/i.test(result.summary)
+    ) {
+      throw new Error("AI Review 未读取应用程序准备的 Diff，任务已标记失败，请重试");
+    }
     await writeFile(path.join(artifactDirectory, "result.json"), `${JSON.stringify(result, null, 2)}\n`, "utf8");
     return result;
+  }
+
+  private async prepareReviewInput(
+    repositoryPath: string,
+    artifactDirectory: string,
+    task: ReviewTask
+  ): Promise<ReviewInputContext> {
+    const filePath = path.join(artifactDirectory, "review-input.patch");
+    const heading = [
+      "# Prepared Git diff for automated code review",
+      `# Task: ${task.id}`,
+      `# Project: ${task.projectName}`,
+      `# Trigger: ${task.triggerType}`,
+      ""
+    ].join("\n");
+    await writeFile(filePath, heading, "utf8");
+    let byteLength = Buffer.byteLength(heading);
+    let truncated = false;
+
+    const appendGit = async (args: string[]) => {
+      const remaining = MAX_REVIEW_CONTEXT_BYTES - byteLength;
+      if (remaining <= 0) {
+        truncated = true;
+        return;
+      }
+      const result = await this.streamGitOutputToFile(
+        repositoryPath,
+        args,
+        filePath,
+        remaining,
+        120_000
+      );
+      byteLength += result.byteLength;
+      truncated ||= result.truncated;
+    };
+
+    if (task.triggerType === "manual" && task.manualSelection?.mode === "commits") {
+      for (const sha of task.manualSelection.commitShas) {
+        if (truncated) break;
+        const commitHeader = `\n\n===== COMMIT ${sha} =====\n`;
+        await writeFile(filePath, commitHeader, { encoding: "utf8", flag: "a" });
+        byteLength += Buffer.byteLength(commitHeader);
+        await appendGit(["--no-pager", "show", "-s", "--format=fuller", sha]);
+        const revision = await this.runCommand("git", ["rev-list", "--parents", "-n", "1", sha], {
+          cwd: repositoryPath,
+          timeoutMs: 30_000
+        });
+        const [, firstParent] = revision.stdout.trim().split(/\s+/);
+        if (firstParent) {
+          await appendGit([
+            "--no-pager", "diff", "--no-color", "--no-ext-diff", "--find-renames",
+            "--stat", "--patch", firstParent, sha, "--"
+          ]);
+        } else {
+          await appendGit([
+            "--no-pager", "show", "--root", "--no-color", "--no-ext-diff", "--find-renames",
+            "--stat", "--patch", "--format=", sha, "--"
+          ]);
+        }
+      }
+    } else {
+      const targetRef = `refs/remotes/origin/${task.targetBranch}`;
+      const headRef = task.triggerType === "manual" && task.manualSelection?.branch
+        ? `refs/remotes/origin/${task.manualSelection.branch}`
+        : "HEAD";
+      const mergeBase = await this.runCommand("git", ["merge-base", targetRef, headRef], {
+        cwd: repositoryPath,
+        timeoutMs: 30_000
+      });
+      const rangeHeader = `\n===== RANGE ${mergeBase.stdout.trim()}..${headRef} =====\n`;
+      await writeFile(filePath, rangeHeader, { encoding: "utf8", flag: "a" });
+      byteLength += Buffer.byteLength(rangeHeader);
+      await appendGit([
+        "--no-pager", "diff", "--no-color", "--no-ext-diff", "--find-renames",
+        "--stat", "--patch", mergeBase.stdout.trim(), headRef, "--"
+      ]);
+    }
+
+    if (truncated) {
+      const notice = `\n\n# PATCH TRUNCATED AT ${MAX_REVIEW_CONTEXT_BYTES} BYTES\n`;
+      await writeFile(filePath, notice, { encoding: "utf8", flag: "a" });
+      byteLength += Buffer.byteLength(notice);
+    }
+    return { filePath, byteLength, truncated };
+  }
+
+  private streamGitOutputToFile(
+    repositoryPath: string,
+    args: string[],
+    filePath: string,
+    byteLimit: number,
+    timeoutMs: number
+  ) {
+    return new Promise<{ byteLength: number; truncated: boolean }>((resolve, reject) => {
+      const output = createWriteStream(filePath, { flags: "a" });
+      const child = spawn("git", args, {
+        cwd: repositoryPath,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false
+      });
+      this.currentChild = child;
+      let byteLength = 0;
+      let stderr = "";
+      let truncated = false;
+      let timedOut = false;
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.currentChild = undefined;
+        output.end(() => error ? reject(error) : resolve({ byteLength, truncated }));
+      };
+      output.once("error", (error) => {
+        child.kill("SIGTERM");
+        finish(error);
+      });
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (truncated) return;
+        const remaining = byteLimit - byteLength;
+        if (chunk.length > remaining) {
+          if (remaining > 0) output.write(chunk.subarray(0, remaining));
+          byteLength += Math.max(0, remaining);
+          truncated = true;
+          child.kill("SIGTERM");
+          return;
+        }
+        byteLength += chunk.length;
+        if (!output.write(chunk)) {
+          child.stdout.pause();
+          output.once("drain", () => child.stdout.resume());
+        }
+      });
+      child.stderr.on("data", (chunk: Buffer) => { stderr = appendLimited(stderr, chunk); });
+      child.once("error", (error) => finish(new Error(`无法启动 Git Diff：${error.message}`)));
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, timeoutMs);
+      timer.unref();
+      child.once("close", (code) => {
+        if (timedOut) finish(new Error(`生成 Review Diff 超时（${timeoutMs / 1000} 秒）`));
+        else if (code !== 0 && !truncated) finish(new Error(`生成 Review Diff 失败：${stderr.trim() || `git exit ${code}`}`));
+        else finish();
+      });
+    });
   }
 
   private async publishGitLabNote(

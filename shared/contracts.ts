@@ -196,7 +196,7 @@ export interface GitRepositoryStatus {
   valid: boolean;
   bare: boolean;
   locked: boolean;
-  clean: boolean;
+  clean?: boolean;
   currentBranch?: string;
   headSha?: string;
   originUrl?: string;
@@ -223,13 +223,51 @@ export interface GitCommitSummary {
   authorEmail: string;
   authoredAt: string;
   refs: string[];
+  graph: GitCommitGraph;
+}
+
+export interface GitCommitGraphSegment {
+  fromLane: number;
+  fromPosition: "top" | "node";
+  toLane: number;
+  toPosition: "node" | "bottom";
+  colorIndex: number;
+}
+
+export interface GitCommitGraph {
+  lane: number;
+  laneCount: number;
+  colorIndex: number;
+  segments: GitCommitGraphSegment[];
+}
+
+export interface GitCommitAuthor {
+  name: string;
+  email: string;
+  commitCount: number;
 }
 
 export interface GitCommitPage {
   items: GitCommitSummary[];
   page: number;
   pageSize: number;
+  total: number;
   hasMore: boolean;
+  authors: GitCommitAuthor[];
+  cache: {
+    generatedAt: string;
+    syncedAt?: string;
+    commitCount: number;
+    refreshed: boolean;
+  };
+}
+
+export interface GitRepositorySyncResult {
+  startedAt: string;
+  completedAt: string;
+  changed: boolean;
+  commitCount: number;
+  cacheGeneratedAt: string;
 }
 
 export interface ManualReviewPreview {
@@ -295,6 +333,18 @@ export interface UpdateReviewProjectInput {
   gitlabProjectRef?: string;
   repositoryUrl?: string;
   defaultBranch?: string;
+}
+
+export interface GitLabProjectMetadata {
+  id: number;
+  name: string;
+  path: string;
+  pathWithNamespace: string;
+  defaultBranch: string;
+  sshRepositoryUrl: string;
+  httpRepositoryUrl: string;
+  webUrl: string;
+  suggestedRepositoryUrl: string;
 }
 
 export interface ProjectWebhookCredentials {

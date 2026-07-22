@@ -372,11 +372,11 @@ body {
 .project-review-grid { align-items: flex-start; }
 .commit-filters { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
 .commit-filters > .ant-input { width: 150px; }
-.commit-tree-cell { position: relative; min-height: 52px; display: flex; align-items: stretch; gap: 13px; }
-.commit-tree-rail { position: relative; width: 18px; flex: 0 0 18px; }
-.commit-tree-rail::before { content: ""; position: absolute; top: -17px; bottom: -17px; left: 8px; width: 2px; background: #dbe3f3; }
-.commit-tree-rail i { position: absolute; top: 15px; left: 3px; width: 12px; height: 12px; border: 3px solid #6b83df; border-radius: 50%; background: #fff; box-shadow: 0 0 0 3px #eef2ff; z-index: 1; }
+.commit-tree-cell { position: relative; min-height: 58px; display: flex; align-items: stretch; gap: 12px; }
+.commit-graph { display: block; flex: 0 0 auto; align-self: center; overflow: visible; }
+.commit-tree-cell:hover .commit-graph circle { fill: #f2f6ff; }
 .commit-main-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 6px; }
+.commit-main-copy .ant-tag { margin-inline-end: 0; }
 .manual-review-card { position: sticky; top: 94px; }
 .manual-review-card .ant-tabs-nav { margin-bottom: 16px; }
 .manual-review-list .ant-list-pagination { margin-top: 14px; }

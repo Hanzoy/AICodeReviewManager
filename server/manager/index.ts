@@ -1,12 +1,31 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import { networkInterfaces } from "node:os";
 import { z } from "zod";
 import type { NodeHeartbeatInput, NodeRegistrationInput } from "../../shared/contracts.js";
 import { HEARTBEAT_TIMEOUT_MS, ManagerFileStore } from "./store.js";
 
-const host = process.env.MANAGER_HOST ?? "127.0.0.1";
+function localNetworkHost() {
+  const candidates = Object.values(networkInterfaces())
+    .flatMap((addresses) => addresses ?? [])
+    .filter((address) => address.family === "IPv4" && !address.internal)
+    .map((address) => address.address);
+  return candidates.sort((left, right) => {
+    const score = (value: string) => value.startsWith("192.168.")
+      ? 3
+      : value.startsWith("10.")
+        ? 2
+        : /^172\.(1[6-9]|2\d|3[01])\./.test(value)
+          ? 1
+          : 0;
+    return score(right) - score(left);
+  })[0] ?? "127.0.0.1";
+}
+
+const host = process.env.MANAGER_HOST ?? "0.0.0.0";
 const port = Number(process.env.MANAGER_PORT ?? 7000);
-const publicUrl = process.env.MANAGER_PUBLIC_URL ?? `http://${host}:${port}`;
+const publicHost = host === "0.0.0.0" || host === "::" ? localNetworkHost() : host;
+const publicUrl = process.env.MANAGER_PUBLIC_URL ?? `http://${publicHost}:${port}`;
 const dataDir = process.env.MANAGER_DATA_DIR ?? "./data/manager";
 const startedAt = new Date().toISOString();
 
@@ -19,7 +38,7 @@ await store.init();
 async function callGroupNode(
   groupId: string,
   nodePath: string,
-  init?: { method?: string; body?: unknown; headers?: Record<string, string | undefined> }
+  init?: { method?: string; body?: unknown; headers?: Record<string, string | undefined>; timeoutMs?: number }
 ) {
   const group = await store.getGroup(groupId);
   if (!group.node || group.node.status !== "online") throw new Error("GROUP_NODE_OFFLINE");
@@ -34,7 +53,7 @@ async function callGroupNode(
         )
       },
       body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-      signal: AbortSignal.timeout(10_000)
+      signal: AbortSignal.timeout(init?.timeoutMs ?? 10_000)
     });
   } catch {
     throw new Error("GROUP_NODE_UNAVAILABLE");
@@ -146,6 +165,14 @@ app.get<{ Params: { groupId: string } }>(
   async (request) => callGroupNode(request.params.groupId, "/api/projects")
 );
 
+app.get<{ Params: { groupId: string }; Querystring: { ref?: string } }>(
+  "/api/groups/:groupId/gitlab/projects/resolve",
+  async (request) => callGroupNode(
+    request.params.groupId,
+    `/api/gitlab/projects/resolve?ref=${encodeURIComponent(request.query.ref ?? "")}`
+  )
+);
+
 app.get<{ Params: { groupId: string; projectId: string } }>(
   "/api/groups/:groupId/projects/:projectId",
   async (request) => callGroupNode(request.params.groupId, `/api/projects/${request.params.projectId}`)
@@ -203,11 +230,21 @@ for (const repositoryResource of ["status", "branches", "commits"] as const) {
       ).toString();
       return callGroupNode(
         request.params.groupId,
-        `/api/projects/${request.params.projectId}/repository/${repositoryResource}${search ? `?${search}` : ""}`
+        `/api/projects/${request.params.projectId}/repository/${repositoryResource}${search ? `?${search}` : ""}`,
+        repositoryResource === "commits" ? { timeoutMs: 180_000 } : undefined
       );
     }
   );
 }
+
+app.post<{ Params: { groupId: string; projectId: string } }>(
+  "/api/groups/:groupId/projects/:projectId/repository/sync",
+  async (request) => callGroupNode(
+    request.params.groupId,
+    `/api/projects/${request.params.projectId}/repository/sync`,
+    { method: "POST", timeoutMs: 30 * 60 * 1000 }
+  )
+);
 
 app.post<{ Params: { groupId: string; projectId: string } }>(
   "/api/groups/:groupId/projects/:projectId/manual-reviews/preview",

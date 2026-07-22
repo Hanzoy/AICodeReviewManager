@@ -8,6 +8,8 @@ import type {
   GitBranchSummary,
   GitCommitPage,
   GitRepositoryStatus,
+  GitRepositorySyncResult,
+  GitLabProjectMetadata,
   CreateManualReviewInput,
   ManualReviewPreview,
   ManagerRuntimeInfo,
@@ -34,6 +36,9 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
       GROUP_NODE_UPGRADE_REQUIRED: "项目组节点版本过旧，请停止并重新启动该节点后再试",
       GROUP_NODE_OFFLINE: "项目组节点当前离线，请先启动节点",
       GROUP_NODE_UNAVAILABLE: "项目组节点暂时无法连接，请检查节点进程",
+      GITLAB_CONNECTION_NOT_CONFIGURED: "请先在项目组设置中配置 GitLab Base URL 和 Access Token",
+      GITLAB_PROJECT_NOT_FOUND: "GitLab 中未找到该项目，请检查 Project ID / Path 和 Token 权限",
+      GITLAB_PROJECT_CLONE_URL_MISSING: "该 GitLab 项目没有可用的 SSH 或 HTTPS Clone 地址",
       "Not Found": "当前项目组节点尚未加载此功能，请停止并重新启动节点"
     };
     throw new Error((code && friendlyMessages[code]) ?? code ?? `请求失败：${response.status}`);
@@ -61,6 +66,10 @@ export const managerApi = {
     }),
   projects: async (groupId: string) =>
     (await request<{ items: ReviewProject[] }>(`/api/groups/${groupId}/projects`)).items,
+  resolveGitLabProject: (groupId: string, projectRef: string) =>
+    request<GitLabProjectMetadata>(
+      `/api/groups/${groupId}/gitlab/projects/resolve?ref=${encodeURIComponent(projectRef)}`
+    ),
   project: (groupId: string, projectId: string) =>
     request<ReviewProject>(`/api/groups/${groupId}/projects/${projectId}`),
   createProject: (groupId: string, input: CreateReviewProjectInput) =>
@@ -82,6 +91,10 @@ export const managerApi = {
     ),
   repositoryStatus: (groupId: string, projectId: string) =>
     request<GitRepositoryStatus>(`/api/groups/${groupId}/projects/${projectId}/repository/status`),
+  syncRepository: (groupId: string, projectId: string) =>
+    request<GitRepositorySyncResult>(`/api/groups/${groupId}/projects/${projectId}/repository/sync`, {
+      method: "POST"
+    }),
   repositoryBranches: async (groupId: string, projectId: string) =>
     (await request<{ items: GitBranchSummary[] }>(
       `/api/groups/${groupId}/projects/${projectId}/repository/branches`
@@ -89,7 +102,7 @@ export const managerApi = {
   repositoryCommits: (
     groupId: string,
     projectId: string,
-    query: { branch?: string; search?: string; since?: string; until?: string; page?: number; pageSize?: number }
+    query: { branch?: string; search?: string; author?: string; since?: string; until?: string; page?: number; pageSize?: number }
   ) => {
     const search = new URLSearchParams();
     Object.entries(query).forEach(([key, value]) => {

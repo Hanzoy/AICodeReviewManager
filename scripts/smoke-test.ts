@@ -7,6 +7,7 @@ import type { AddressInfo } from "node:net";
 import type {
   EnrollmentResult,
   GitLabWebhookResult,
+  GitLabProjectMetadata,
   GitRepositoryStatus,
   GroupNodeConfig,
   GroupWorkspaceData,
@@ -14,11 +15,13 @@ import type {
   ProjectWebhookCredentials,
   ReviewTask
 } from "../shared/contracts.js";
+import { resolveGitRepositoryAccess } from "../server/group/git-auth.js";
 
 const managerUrl = process.env.MANAGER_PUBLIC_URL ?? "http://127.0.0.1:7000";
 const key = `smoke-${randomBytes(4).toString("hex")}`;
 let enrollment: EnrollmentResult | undefined;
 let groupNode: ChildProcess | undefined;
+let groupNodeOutput = "";
 let groupDataDir: string | undefined;
 let nodeCredential: { nodeId: string; nodeToken: string } | undefined;
 let feishuPayload: {
@@ -28,6 +31,8 @@ let feishuPayload: {
   content?: { text?: string };
 } | undefined;
 let feishuServerStarted = false;
+let gitlabServerStarted = false;
+let gitlabLookupToken: string | undefined;
 const feishuServer = createServer((request, response) => {
   let body = "";
   request.on("data", (chunk) => { body += chunk.toString(); });
@@ -36,6 +41,25 @@ const feishuServer = createServer((request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ code: 0, msg: "success" }));
   });
+});
+const gitlabServer = createServer((request, response) => {
+  gitlabLookupToken = request.headers["private-token"] as string | undefined;
+  if (request.url === "/api/v4/projects/smoke%2Fproject") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: 12345,
+      name: "Smoke Project",
+      path: "project",
+      path_with_namespace: "smoke/project",
+      default_branch: "develop",
+      ssh_url_to_repo: "git@gitlab.example.com:smoke/project.git",
+      http_url_to_repo: "https://gitlab.example.com/smoke/project.git",
+      web_url: "https://gitlab.example.com/smoke/project"
+    }));
+    return;
+  }
+  response.writeHead(404, { "content-type": "application/json" });
+  response.end(JSON.stringify({ message: "404 Project Not Found" }));
 });
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
@@ -52,13 +76,13 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 async function waitForOnline(groupId: string) {
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     const response = await json<{ item: ProjectGroupSummary }>(`${managerUrl}/api/groups/${groupId}`);
     if (response.item.node?.status === "online") return response.item;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
-  throw new Error("Group node did not become online in time");
+  throw new Error(`Group node did not become online in time${groupNodeOutput ? `\n${groupNodeOutput}` : ""}`);
 }
 
 try {
@@ -82,8 +106,13 @@ try {
       "--name=Smoke Test Group",
       `--data-dir=${dataDir}`
     ],
-    { cwd: process.cwd(), stdio: "ignore", windowsHide: true }
+    { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
   );
+  const captureGroupNodeOutput = (chunk: Buffer) => {
+    groupNodeOutput = `${groupNodeOutput}${chunk.toString()}`.slice(-32_768);
+  };
+  groupNode.stdout?.on("data", captureGroupNodeOutput);
+  groupNode.stderr?.on("data", captureGroupNodeOutput);
 
   const onlineGroup = await waitForOnline(groupId);
   if (!onlineGroup.node || onlineGroup.node.port <= 0) {
@@ -102,6 +131,9 @@ try {
   await new Promise<void>((resolve) => feishuServer.listen(0, "127.0.0.1", resolve));
   feishuServerStarted = true;
   const feishuPort = (feishuServer.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => gitlabServer.listen(0, "127.0.0.1", resolve));
+  gitlabServerStarted = true;
+  const gitlabPort = (gitlabServer.address() as AddressInfo).port;
 
   const updatedConfig = await json<GroupNodeConfig>(
     `${managerUrl}/api/groups/${groupId}/config`,
@@ -109,6 +141,11 @@ try {
       method: "PUT",
       body: JSON.stringify({
         general: { displayName: "Smoke Test Workspace" },
+        gitlab: {
+          baseUrl: `http://127.0.0.1:${gitlabPort}`,
+          apiUrl: "",
+          token: "smoke-gitlab-token"
+        },
         ai: { model: "smoke-model", apiKey: "temporary-smoke-key" },
         feishu: {
           enabled: true,
@@ -126,6 +163,34 @@ try {
     throw new Error("Group node exposed an unexpected AI runtime implementation detail");
   }
 
+  const resolvedProject = await json<GitLabProjectMetadata>(
+    `${managerUrl}/api/groups/${groupId}/gitlab/projects/resolve?ref=${encodeURIComponent("smoke/project")}`
+  );
+  if (
+    resolvedProject.id !== 12345 ||
+    resolvedProject.defaultBranch !== "develop" ||
+    resolvedProject.suggestedRepositoryUrl !== "https://gitlab.example.com/smoke/project.git" ||
+    gitlabLookupToken !== "smoke-gitlab-token"
+  ) {
+    throw new Error("GitLab project metadata was not resolved through the group node");
+  }
+  const repositoryAccess = await resolveGitRepositoryAccess({
+    dataDir,
+    configuredRepositoryUrl: "git@gitlab.example.com:smoke/project.git",
+    gitlabProjectRef: "smoke/project",
+    gitlabConfig: updatedConfig.gitlab,
+    gitlabToken: "smoke-gitlab-token"
+  });
+  if (
+    repositoryAccess.repositoryUrl !== "https://gitlab.example.com/smoke/project.git" ||
+    repositoryAccess.authentication !== "gitlab-token" ||
+    repositoryAccess.environment.CODE_REVIEW_GITLAB_TOKEN !== "smoke-gitlab-token" ||
+    repositoryAccess.environment.GIT_CONFIG_KEY_0 !== "credential.helper" ||
+    repositoryAccess.environment.GIT_CONFIG_VALUE_0 !== ""
+  ) {
+    throw new Error("SSH repository URL was not converted to project-group Access Token authentication");
+  }
+
   const projectCredentials = await json<ProjectWebhookCredentials>(
     `${managerUrl}/api/groups/${groupId}/projects`,
     {
@@ -136,7 +201,7 @@ try {
         description: "Webhook integration test",
         enabled: true,
         gitlabProjectRef: "12345",
-        repositoryUrl: "https://gitlab.example.com/smoke/project.git",
+        repositoryUrl: resolvedProject.suggestedRepositoryUrl,
         defaultBranch: "main"
       })
     }
@@ -245,6 +310,9 @@ try {
 } finally {
   if (feishuServerStarted) {
     await new Promise<void>((resolve) => feishuServer.close(() => resolve()));
+  }
+  if (gitlabServerStarted) {
+    await new Promise<void>((resolve) => gitlabServer.close(() => resolve()));
   }
   if (enrollment && nodeCredential) {
     await fetch(`${managerUrl}/api/nodes/${nodeCredential.nodeId}/deregister`, {

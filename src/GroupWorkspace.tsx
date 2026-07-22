@@ -64,6 +64,7 @@ import type {
   GitBranchSummary,
   GitCommitPage,
   GitCommitSummary,
+  GitLabProjectMetadata,
   GitRepositoryStatus,
   GroupNodeConfig,
   GroupNodeConfigUpdate,
@@ -75,12 +76,77 @@ import type {
   UpdateReviewProjectInput
 } from "../shared/contracts";
 import { managerApi } from "./api";
+import { frontendHostPort, withFrontendHostname } from "./frontendAddress";
+import { useVisiblePolling } from "./useVisiblePolling";
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
 export type WorkspacePage = "dashboard" | "projects" | "reviews" | "settings";
 type SettingsSection = "general" | "gitlab" | "ai" | "feishu";
 type ReviewView = "all" | "queued" | "completed" | "findings";
+
+const EMPTY_COMMIT_PAGE: GitCommitPage = {
+  items: [],
+  page: 1,
+  pageSize: 50,
+  total: 0,
+  hasMore: false,
+  authors: [],
+  cache: { generatedAt: "", commitCount: 0, refreshed: false }
+};
+
+const COMMIT_GRAPH_COLORS = [
+  "#5277d6",
+  "#63a958",
+  "#d3a538",
+  "#b26bd6",
+  "#4ca5c7",
+  "#d45f66",
+  "#73839d",
+  "#d17b3f"
+];
+
+function CommitGraph({ commit }: { commit: GitCommitSummary }) {
+  const { graph } = commit;
+  const laneGap = Math.max(8, Math.min(18, 184 / Math.max(1, graph.laneCount - 1)));
+  const padding = 8;
+  const width = Math.max(28, padding * 2 + (graph.laneCount - 1) * laneGap);
+  const x = (lane: number) => padding + lane * laneGap;
+  const y = { top: 0, node: 29, bottom: 58 } as const;
+  const color = (index: number) => COMMIT_GRAPH_COLORS[index % COMMIT_GRAPH_COLORS.length];
+  const pathFor = (segment: GitCommitSummary["graph"]["segments"][number]) => {
+    const fromX = x(segment.fromLane);
+    const toX = x(segment.toLane);
+    const fromY = y[segment.fromPosition];
+    const toY = y[segment.toPosition];
+    if (fromX === toX) return `M ${fromX} ${fromY} L ${toX} ${toY}`;
+    const middleY = (fromY + toY) / 2;
+    return `M ${fromX} ${fromY} C ${fromX} ${middleY}, ${toX} ${middleY}, ${toX} ${toY}`;
+  };
+
+  return (
+    <svg
+      className="commit-graph"
+      width={width}
+      height={58}
+      viewBox={`0 0 ${width} 58`}
+      role="img"
+      aria-label={`Commit 拓扑轨道 ${graph.lane + 1}`}
+    >
+      {graph.segments.map((segment, index) => (
+        <path
+          key={`${segment.fromLane}-${segment.fromPosition}-${segment.toLane}-${segment.toPosition}-${index}`}
+          d={pathFor(segment)}
+          fill="none"
+          stroke={color(segment.colorIndex)}
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+      ))}
+      <circle cx={x(graph.lane)} cy={y.node} r="5" fill="#fff" stroke={color(graph.colorIndex)} strokeWidth="3" />
+    </svg>
+  );
+}
 
 export function GroupWorkspace({
   group,
@@ -107,22 +173,38 @@ export function GroupWorkspace({
   const [error, setError] = useState<string>();
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [reviewView, setReviewView] = useState<ReviewView>("all");
+  const loadInFlight = useRef<Promise<void> | undefined>(undefined);
   const { message } = AntApp.useApp();
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      setWorkspace(await managerApi.workspace(group.id));
-      setError(undefined);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "项目组节点不可用");
-    } finally {
-      setLoading(false);
-    }
+  const load = useCallback((quiet = false) => {
+    if (loadInFlight.current) return loadInFlight.current;
+    if (!quiet) setLoading(true);
+    const operation = (async () => {
+      try {
+        setWorkspace(await managerApi.workspace(group.id));
+        setError(undefined);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "项目组节点不可用");
+      } finally {
+        if (!quiet) setLoading(false);
+      }
+    })();
+    loadInFlight.current = operation;
+    void operation.finally(() => {
+      if (loadInFlight.current === operation) loadInFlight.current = undefined;
+    });
+    return operation;
   }, [group.id]);
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  const previousPage = useRef(page);
+  useEffect(() => {
+    const changed = previousPage.current !== page;
+    previousPage.current = page;
+    if (changed && page === "dashboard") void load(true);
   }, [load, page]);
 
   const saveConfig = async (input: GroupNodeConfigUpdate) => {
@@ -187,7 +269,7 @@ export function GroupWorkspace({
           </Space>
           <Space>
             <Tag color={online ? "success" : "error"}>{online ? "节点在线" : "节点离线"}</Tag>
-            {group.node ? <Text code>{group.node.host}:{group.node.port}</Text> : null}
+            {group.node ? <Text code>{frontendHostPort(group.node.host, group.node.port)}</Text> : null}
           </Space>
         </Header>
 
@@ -439,8 +521,10 @@ function ProjectsPage({ groupId, onProjectOpen }: { groupId: string; onProjectOp
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>();
   const [saving, setSaving] = useState(false);
+  const [resolvingGitLab, setResolvingGitLab] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<ReviewProject>();
+  const [gitLabMetadata, setGitLabMetadata] = useState<GitLabProjectMetadata>();
   const [webhookInfo, setWebhookInfo] = useState<{ project: ReviewProject; secret?: string }>();
   const [form] = Form.useForm();
   const { message, modal } = AntApp.useApp();
@@ -463,6 +547,7 @@ function ProjectsPage({ groupId, onProjectOpen }: { groupId: string; onProjectOp
 
   const openCreate = () => {
     setEditing(undefined);
+    setGitLabMetadata(undefined);
     form.resetFields();
     form.setFieldsValue({ enabled: true, defaultBranch: "main" });
     setEditorOpen(true);
@@ -470,15 +555,66 @@ function ProjectsPage({ groupId, onProjectOpen }: { groupId: string; onProjectOp
 
   const openEdit = (project: ReviewProject) => {
     setEditing(project);
+    setGitLabMetadata(undefined);
     form.resetFields();
     form.setFieldsValue(project);
     setEditorOpen(true);
   };
 
+  const resolveProjectRef = async (projectRef?: string) => {
+    const ref = (projectRef ?? form.getFieldValue("gitlabProjectRef") ?? "").trim();
+    if (!ref) {
+      await form.validateFields(["gitlabProjectRef"]);
+      return undefined;
+    }
+    setResolvingGitLab(true);
+    try {
+      const metadata = await managerApi.resolveGitLabProject(groupId, ref);
+      const currentName = form.getFieldValue("name") as string | undefined;
+      const currentKey = form.getFieldValue("key") as string | undefined;
+      const suggestedKey = metadata.path
+        .replace(/[^A-Za-z0-9_-]+/g, "-")
+        .replace(/^[^A-Za-z0-9]+/, "") || `project-${metadata.id}`;
+      form.setFieldsValue({
+        name: editing || (currentName && form.isFieldTouched("name")) ? currentName : metadata.name,
+        key: editing || (currentKey && form.isFieldTouched("key")) ? currentKey : suggestedKey,
+        repositoryUrl: metadata.suggestedRepositoryUrl,
+        defaultBranch: metadata.defaultBranch
+      });
+      setGitLabMetadata(metadata);
+      message.success("已读取 GitLab 项目信息");
+      return metadata;
+    } catch (caught) {
+      message.error(caught instanceof Error ? caught.message : "GitLab 项目信息读取失败");
+      return undefined;
+    } finally {
+      setResolvingGitLab(false);
+    }
+  };
+
   const saveProject = async () => {
-    const values = await form.validateFields() as CreateReviewProjectInput;
+    const projectRef = String(form.getFieldValue("gitlabProjectRef") ?? "").trim();
+    if (!projectRef) {
+      await form.validateFields(["gitlabProjectRef"]);
+      return;
+    }
     setSaving(true);
     try {
+      let resolvedMetadata = gitLabMetadata;
+      if (!form.getFieldValue("repositoryUrl") || !form.getFieldValue("defaultBranch")) {
+        resolvedMetadata = await resolveProjectRef(projectRef);
+        if (!resolvedMetadata) return;
+      }
+      const validatedValues = await form.validateFields();
+      const values = {
+        ...validatedValues,
+        repositoryUrl: String(
+          form.getFieldValue("repositoryUrl") ?? resolvedMetadata?.suggestedRepositoryUrl ?? ""
+        ).trim(),
+        defaultBranch: String(
+          form.getFieldValue("defaultBranch") ?? resolvedMetadata?.defaultBranch ?? ""
+        ).trim()
+      } as CreateReviewProjectInput;
       if (editing) {
         const { key: _immutableKey, ...input } = values;
         await managerApi.updateProject(groupId, editing.id, input as UpdateReviewProjectInput);
@@ -643,32 +779,84 @@ function ProjectsPage({ groupId, onProjectOpen }: { groupId: string; onProjectOp
         forceRender
       >
         <Alert
-          type="info"
-          showIcon
-          message="GitLab Project 可填写数字 ID 或 namespace/project 路径"
-          description="项目创建后会生成唯一的 Webhook URL 和 Secret，项目组节点不会保存 Secret 明文。"
-          style={{ marginBottom: 18 }}
-        />
+        type="info"
+        showIcon
+        message="只需填写 GitLab Project ID / Path"
+        description="系统会通过项目组 GitLab 连接自动读取项目名称、默认分支和 Clone 地址；镜像仓库等特殊情况可在高级设置中覆盖。"
+        style={{ marginBottom: 18 }}
+      />
         <Form form={form} layout="vertical" requiredMark="optional">
+          <Form.Item name="gitlabProjectRef" label="GitLab Project ID / Path" rules={[{ required: true }]} extra="例如：128 或 g004/g004_client">
+            <Input.Search
+              placeholder="g004/g004_client"
+              enterButton="读取项目信息"
+              loading={resolvingGitLab}
+              autoFocus={!editing}
+              onSearch={(value) => void resolveProjectRef(value)}
+              onChange={(event) => {
+                const value = event.target.value.trim();
+                setGitLabMetadata(undefined);
+                if (value !== editing?.gitlabProjectRef) {
+                  form.setFieldsValue({ repositoryUrl: undefined, defaultBranch: undefined });
+                } else if (editing) {
+                  form.setFieldsValue({ repositoryUrl: editing.repositoryUrl, defaultBranch: editing.defaultBranch });
+                }
+              }}
+            />
+          </Form.Item>
+          {gitLabMetadata ? (
+            <Alert
+              type="success"
+              showIcon
+              message={`${gitLabMetadata.pathWithNamespace} · Project ID ${gitLabMetadata.id}`}
+              description={(
+                <Space direction="vertical" size={2}>
+                  <Text>默认分支：<Text code>{gitLabMetadata.defaultBranch}</Text></Text>
+                  <Text type="secondary">已自动选择：{gitLabMetadata.suggestedRepositoryUrl}</Text>
+                  {gitLabMetadata.webUrl ? <a href={gitLabMetadata.webUrl} target="_blank" rel="noreferrer">在 GitLab 中打开</a> : null}
+                </Space>
+              )}
+              style={{ marginBottom: 18 }}
+            />
+          ) : null}
           <Row gutter={16}>
-            <Col xs={24} md={14}><Form.Item name="name" label="项目名称" rules={[{ required: true, min: 2 }]}><Input placeholder="G004 Client" autoFocus /></Form.Item></Col>
+            <Col xs={24} md={14}><Form.Item name="name" label="项目名称" rules={[{ required: true, min: 2 }]}><Input placeholder="由 GitLab 自动填写" /></Form.Item></Col>
             <Col xs={24} md={10}>
               <Form.Item name="key" label="项目标识" rules={[{ required: true }, { pattern: /^[A-Za-z0-9][A-Za-z0-9_-]*$/, message: "只能使用字母、数字、连字符和下划线" }]}>
-                <Input placeholder="g004-client" disabled={Boolean(editing)} />
+                <Input placeholder="由 GitLab 自动填写" disabled={Boolean(editing)} />
               </Form.Item>
             </Col>
           </Row>
           <Form.Item name="description" label="项目说明"><Input.TextArea rows={2} /></Form.Item>
-          <Form.Item name="gitlabProjectRef" label="GitLab Project ID / Path" rules={[{ required: true }]} extra="例如：128 或 g004/g004_client">
-            <Input placeholder="g004/g004_client" />
-          </Form.Item>
-          <Form.Item name="repositoryUrl" label="Git 仓库地址" rules={[{ required: true }]} extra="支持 HTTPS 或 SSH Clone 地址">
-            <Input placeholder="https://gitlab.example.com/g004/g004_client.git" />
-          </Form.Item>
-          <Row gutter={16}>
-            <Col xs={24} md={16}><Form.Item name="defaultBranch" label="默认目标分支" rules={[{ required: true }]}><Input placeholder="main" /></Form.Item></Col>
-            <Col xs={24} md={8}><Form.Item name="enabled" label="启用 Review" valuePropName="checked"><Switch /></Form.Item></Col>
-          </Row>
+          <Form.Item name="enabled" label="启用 Review" valuePropName="checked"><Switch /></Form.Item>
+          <Collapse
+            size="small"
+            items={[{
+              key: "advanced",
+              label: "高级设置（Clone 地址和默认分支）",
+              forceRender: true,
+              children: (
+                <>
+                  <Form.Item
+                    name="repositoryUrl"
+                    label="Git 仓库地址覆盖"
+                    rules={[{ required: true, message: "请先读取 GitLab 项目信息，或手动填写 Clone 地址" }]}
+                    extra={gitLabMetadata ? (
+                      <Space size={4} wrap>
+                        <Text type="secondary">Review 使用项目组 Access Token，不使用本机 Git/SSH 用户。</Text>
+                        {gitLabMetadata.httpRepositoryUrl ? <Button type="link" size="small" onClick={() => form.setFieldValue("repositoryUrl", gitLabMetadata.httpRepositoryUrl)}>恢复 GitLab HTTPS 地址</Button> : null}
+                      </Space>
+                    ) : "正常情况下由 GitLab 自动填写；旧的 SSH 地址会在执行时自动转换为 HTTPS"}
+                  >
+                    <Input placeholder="由 GitLab 自动填写" />
+                  </Form.Item>
+                  <Form.Item name="defaultBranch" label="默认分支" rules={[{ required: true }]}>
+                    <Input placeholder="由 GitLab 自动填写" />
+                  </Form.Item>
+                </>
+              )
+            }]}
+          />
         </Form>
       </Modal>
 
@@ -690,7 +878,14 @@ function ProjectsPage({ groupId, onProjectOpen }: { groupId: string; onProjectOp
               description={webhookInfo.secret ? "关闭窗口前请将 URL 和 Secret 配置到 GitLab。" : "如果 Secret 已丢失，请轮换后重新配置 GitLab Webhook。"}
             />
             <Descriptions bordered column={1} size="small">
-              <Descriptions.Item label="URL"><Text copyable code>{webhookInfo.project.webhook.url}</Text></Descriptions.Item>
+              <Descriptions.Item label="URL">
+                <Text
+                  copyable={{ text: withFrontendHostname(webhookInfo.project.webhook.url) }}
+                  code
+                >
+                  {withFrontendHostname(webhookInfo.project.webhook.url)}
+                </Text>
+              </Descriptions.Item>
               <Descriptions.Item label="Secret token">
                 {webhookInfo.secret ? <Text copyable code>{webhookInfo.secret}</Text> : <Text type="secondary">不可再次查看</Text>}
               </Descriptions.Item>
@@ -731,12 +926,14 @@ function ProjectDetailPage({
   const [project, setProject] = useState<ReviewProject>();
   const [repositoryStatus, setRepositoryStatus] = useState<GitRepositoryStatus>();
   const [branches, setBranches] = useState<GitBranchSummary[]>([]);
-  const [commitPage, setCommitPage] = useState<GitCommitPage>({ items: [], page: 1, pageSize: 50, hasMore: false });
+  const [commitPage, setCommitPage] = useState<GitCommitPage>(EMPTY_COMMIT_PAGE);
   const [tasks, setTasks] = useState<ReviewTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [commitLoading, setCommitLoading] = useState(false);
+  const [syncingRepository, setSyncingRepository] = useState(false);
   const [loadError, setLoadError] = useState<string>();
   const [branchFilter, setBranchFilter] = useState<string>();
+  const [authorFilter, setAuthorFilter] = useState<string>();
   const [search, setSearch] = useState("");
   const [searchDraft, setSearchDraft] = useState("");
   const [since, setSince] = useState("");
@@ -787,6 +984,7 @@ function ProjectDetailPage({
       setCommitPage(await managerApi.repositoryCommits(groupId, projectId, {
         branch: branchFilter,
         search,
+        author: authorFilter,
         since,
         until,
         page,
@@ -797,7 +995,7 @@ function ProjectDetailPage({
     } finally {
       setCommitLoading(false);
     }
-  }, [branchFilter, groupId, message, page, pageSize, projectId, repositoryStatus?.valid, search, since, until]);
+  }, [authorFilter, branchFilter, groupId, message, page, pageSize, projectId, repositoryStatus?.valid, search, since, until]);
 
   useEffect(() => {
     void loadProject();
@@ -807,12 +1005,11 @@ function ProjectDetailPage({
     void loadCommits();
   }, [loadCommits]);
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void managerApi.reviews(groupId).then(setTasks).catch(() => undefined);
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [groupId]);
+  const hasActiveReviewTasks = tasks.some((task) => task.status === "queued" || task.status === "running");
+  useVisiblePolling(
+    () => managerApi.reviews(groupId).then(setTasks),
+    hasActiveReviewTasks ? 3_000 : 30_000
+  );
 
   useEffect(() => {
     if (!focusTaskId || handledFocusTask.current === focusTaskId) return;
@@ -827,6 +1024,37 @@ function ProjectDetailPage({
   }, [focusTaskId, projectId, tasks]);
 
   const resetSelectionPreview = () => setPreview(undefined);
+  const syncRemote = async () => {
+    setSyncingRepository(true);
+    try {
+      const result = await managerApi.syncRepository(groupId, projectId);
+      setBranchFilter(undefined);
+      setAuthorFilter(undefined);
+      setSearch("");
+      setSearchDraft("");
+      setSince("");
+      setUntil("");
+      setPage(1);
+      setSelectedShas([]);
+      resetSelectionPreview();
+      const [statusResult, branchResult, commitResult] = await Promise.all([
+        managerApi.repositoryStatus(groupId, projectId),
+        managerApi.repositoryBranches(groupId, projectId),
+        managerApi.repositoryCommits(groupId, projectId, { page: 1, pageSize })
+      ]);
+      setRepositoryStatus(statusResult);
+      setBranches(branchResult);
+      setCommitPage(commitResult);
+      message.success(result.changed
+        ? `远端同步完成，Commit 缓存已更新（${result.commitCount} 个）`
+        : `远端没有新引用，继续使用现有缓存（${result.commitCount} 个）`);
+    } catch (caught) {
+      message.error(caught instanceof Error ? caught.message : "远端同步失败");
+    } finally {
+      setSyncingRepository(false);
+    }
+  };
+
   const manualInput = (): CreateManualReviewInput => ({
     selection: selectionMode === "branch"
       ? {
@@ -902,7 +1130,18 @@ function ProjectDetailPage({
             <Paragraph type="secondary">{project.description || project.gitlabProjectRef}</Paragraph>
           </div>
         </Space>
-        <Button icon={<ReloadOutlined />} onClick={() => void loadProject()}>刷新仓库</Button>
+        <Space>
+          <Button onClick={() => void loadProject()}>重新检测</Button>
+          <Button
+            type="primary"
+            icon={<ReloadOutlined spin={syncingRepository} />}
+            loading={syncingRepository}
+            disabled={!repositoryStatus?.valid}
+            onClick={() => void syncRemote()}
+          >
+            同步远端
+          </Button>
+        </Space>
       </section>
 
       <Card bordered={false} className="content-card repository-overview-card">
@@ -913,7 +1152,7 @@ function ProjectDetailPage({
           description={!repositoryReady
             ? `可以把同一仓库的完整目录（必须包含 .git）复制到 ${project.localRepositoryPath}，完成后点击“刷新仓库”进行校验。${repositoryStatus.error ? ` 当前状态：${repositoryStatus.error}` : ""}`
             : repositoryStatus.remoteMatches
-              ? "Commit 查询只读取本地 Git 数据；真正执行 Review 前仍会在串行队列中 Fetch 并校验范围。"
+              ? "打开 Commit 树只读取本地缓存；点击“同步远端”才会 Fetch 全部分支并更新缓存。Review 执行前仍会严格检查工作区。"
               : `当前 Origin：${repositoryStatus.originUrl || "未配置"}；项目配置：${project.repositoryUrl}`}
           style={{ marginBottom: 18 }}
         />
@@ -921,7 +1160,11 @@ function ProjectDetailPage({
           <Descriptions.Item label="本地路径"><Text copyable code>{project.localRepositoryPath}</Text></Descriptions.Item>
           <Descriptions.Item label="当前分支">{repositoryStatus.currentBranch ?? "—"}</Descriptions.Item>
           <Descriptions.Item label="HEAD"><Text code>{repositoryStatus.headSha?.slice(0, 12) ?? "—"}</Text></Descriptions.Item>
-          <Descriptions.Item label="工作区">{repositoryStatus.clean ? <Tag color="success">干净</Tag> : <Tag color="warning">有未提交修改</Tag>}</Descriptions.Item>
+          <Descriptions.Item label="工作区">{repositoryStatus.clean === undefined
+            ? <Tag>Review 前检查</Tag>
+            : repositoryStatus.clean
+              ? <Tag color="success">干净</Tag>
+              : <Tag color="warning">有未提交修改</Tag>}</Descriptions.Item>
         </Descriptions>
       </Card>
 
@@ -932,7 +1175,18 @@ function ProjectDetailPage({
               bordered={false}
               className="content-card"
               title={<Space><HistoryOutlined />Commit 树</Space>}
-              extra={<Text type="secondary">已选择 {selectedShas.length} 个 Commit</Text>}
+              extra={(
+                <Space wrap>
+                  {commitPage.cache.generatedAt ? (
+                    <Tooltip title={`缓存生成：${new Date(commitPage.cache.generatedAt).toLocaleString("zh-CN")}${commitPage.cache.syncedAt ? `；最后同步：${new Date(commitPage.cache.syncedAt).toLocaleString("zh-CN")}` : ""}`}>
+                      <Tag color={commitPage.cache.refreshed ? "processing" : "default"}>
+                        {commitPage.cache.refreshed ? "缓存已更新" : `本地缓存 ${commitPage.cache.commitCount}`}
+                      </Tag>
+                    </Tooltip>
+                  ) : null}
+                  <Text type="secondary">已选择 {selectedShas.length} 个 Commit</Text>
+                </Space>
+              )}
             >
               <div className="commit-filters">
                 <Select
@@ -940,9 +1194,22 @@ function ProjectDetailPage({
                   showSearch
                   placeholder="全部分支"
                   value={branchFilter}
-                  onChange={(value) => { setBranchFilter(value); setPage(1); setSelectedShas([]); resetSelectionPreview(); }}
+                  onChange={(value) => { setBranchFilter(value); setAuthorFilter(undefined); setPage(1); setSelectedShas([]); resetSelectionPreview(); }}
                   options={branches.map((branch) => ({ value: branch.name, label: branch.name }))}
                   style={{ minWidth: 190 }}
+                />
+                <Select
+                  allowClear
+                  showSearch
+                  optionFilterProp="label"
+                  placeholder="全部提交人"
+                  value={authorFilter}
+                  onChange={(value) => { setAuthorFilter(value); setPage(1); }}
+                  options={commitPage.authors.map((author) => ({
+                    value: author.email ? `${author.name} <${author.email}>` : author.name,
+                    label: `${author.name}${author.email ? ` · ${author.email}` : ""}（${author.commitCount}）`
+                  }))}
+                  style={{ minWidth: 220 }}
                 />
                 <Input.Search
                   allowClear
@@ -967,32 +1234,55 @@ function ProjectDetailPage({
                 pagination={{
                   current: page,
                   pageSize,
-                  total: commitPage.hasMore ? page * pageSize + 1 : (page - 1) * pageSize + commitPage.items.length,
+                  total: commitPage.total,
                   showSizeChanger: true,
+                  showTotal: (total) => `共 ${total} 个 Commit`,
                   pageSizeOptions: [20, 50, 100],
                   onChange: (nextPage, nextSize) => { setPage(nextPage); setPageSize(nextSize); }
                 }}
                 locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的 Commit" /> }}
+                scroll={{ x: 900 }}
                 columns={[
                   {
                     title: "Commit",
                     key: "commit",
+                    width: 500,
                     render: (_value, commit) => (
                       <div className="commit-tree-cell">
-                        <span className="commit-tree-rail"><i /></span>
+                        <CommitGraph commit={commit} />
                         <div className="commit-main-copy">
                           <Flex gap={8} align="center" wrap>
                             <Text strong>{commit.subject}</Text>
-                            {commit.refs.slice(0, 3).map((ref) => <Tag key={ref} color="blue">{ref}</Tag>)}
+                            {commit.refs.slice(0, 3).map((ref, index) => (
+                              <Tag key={ref} color={["blue", "purple", "cyan"][index % 3]}>{ref.replace(/^HEAD -> /, "")}</Tag>
+                            ))}
+                            {commit.refs.length > 3 ? <Tag>+{commit.refs.length - 3}</Tag> : null}
                           </Flex>
-                          <Space size={8} wrap>
-                            <Text code>{commit.shortSha}</Text>
-                            <Text type="secondary">{commit.authorName}</Text>
-                            <Text type="secondary">{new Date(commit.authoredAt).toLocaleString("zh-CN")}</Text>
-                          </Space>
                         </div>
                       </div>
                     )
+                  },
+                  {
+                    title: "提交人",
+                    key: "author",
+                    width: 160,
+                    render: (_value, commit) => (
+                      <Tooltip title={commit.authorEmail}>
+                        <Space size={7}><Avatar size={22}>{commit.authorName.slice(0, 1).toUpperCase()}</Avatar><Text ellipsis>{commit.authorName}</Text></Space>
+                      </Tooltip>
+                    )
+                  },
+                  {
+                    title: "提交时间",
+                    dataIndex: "authoredAt",
+                    width: 180,
+                    render: (value: string) => <Text type="secondary">{new Date(value).toLocaleString("zh-CN")}</Text>
+                  },
+                  {
+                    title: "SHA",
+                    dataIndex: "shortSha",
+                    width: 100,
+                    render: (value: string) => <Text code copyable={{ text: value }}>{value}</Text>
                   }
                 ]}
               />
@@ -1156,25 +1446,38 @@ function ReviewsPage({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>();
   const [resultTask, setResultTask] = useState<ReviewTask>();
+  const loadTasksInFlight = useRef<Promise<void> | undefined>(undefined);
   const { message } = AntApp.useApp();
 
-  const loadTasks = useCallback(async (quiet = false) => {
+  const loadTasks = useCallback((quiet = false) => {
+    if (loadTasksInFlight.current) return loadTasksInFlight.current;
     if (!quiet) setLoading(true);
-    try {
-      setTasks(await managerApi.reviews(groupId));
-      setLoadError(undefined);
-    } catch (caught) {
-      setLoadError(caught instanceof Error ? caught.message : "Review 任务加载失败");
-    } finally {
-      if (!quiet) setLoading(false);
-    }
+    const operation = (async () => {
+      try {
+        setTasks(await managerApi.reviews(groupId));
+        setLoadError(undefined);
+      } catch (caught) {
+        setLoadError(caught instanceof Error ? caught.message : "Review 任务加载失败");
+      } finally {
+        if (!quiet) setLoading(false);
+      }
+    })();
+    loadTasksInFlight.current = operation;
+    void operation.finally(() => {
+      if (loadTasksInFlight.current === operation) loadTasksInFlight.current = undefined;
+    });
+    return operation;
   }, [groupId]);
 
   useEffect(() => {
     void loadTasks();
-    const timer = window.setInterval(() => void loadTasks(true), 3000);
-    return () => window.clearInterval(timer);
   }, [loadTasks]);
+
+  const hasActiveReviewTasks = tasks.some((task) => task.status === "queued" || task.status === "running");
+  useVisiblePolling(
+    () => loadTasks(true),
+    hasActiveReviewTasks ? 3_000 : 30_000
+  );
 
   const retryTask = async (task: ReviewTask) => {
     try {
@@ -1417,7 +1720,14 @@ function GitLabForm({ config, saving, onSave }: FormProps) {
     <Form layout="vertical" initialValues={{ gitlab: config.gitlab }} onFinish={(values) => void onSave(values as GroupNodeConfigUpdate)} className="settings-form">
       <Flex justify="space-between" align="center"><Title level={4}>GitLab 连接</Title><ConfigTag configured={config.gitlab.tokenConfigured && Boolean(config.gitlab.baseUrl)} /></Flex>
       <Form.Item name={["gitlab", "baseUrl"]} label="GitLab Base URL" rules={[{ type: "url", warningOnly: true }]}><Input placeholder="https://gitlab.example.com" /></Form.Item>
-      <Form.Item name={["gitlab", "apiUrl"]} label="API URL" rules={[{ type: "url", warningOnly: true }]}><Input placeholder="https://gitlab.example.com/api/v4" /></Form.Item>
+      <Form.Item
+        name={["gitlab", "apiUrl"]}
+        label="API URL（可选）"
+        extra="留空时自动使用 GitLab Base URL + /api/v4；仅自定义 API 路径时需要填写。"
+        rules={[{ type: "url", warningOnly: true }]}
+      >
+        <Input placeholder="留空自动生成，例如 https://gitlab.example.com/api/v4" />
+      </Form.Item>
       <Form.Item name={["gitlab", "token"]} label="Access Token" extra={config.gitlab.tokenConfigured ? "已经配置 Token，留空不会修改。" : "Token 将在项目组节点本地加密保存。"}><Input.Password placeholder={config.gitlab.tokenConfigured ? "已配置，留空不修改" : "输入 Access Token"} autoComplete="new-password" /></Form.Item>
       <Row gutter={16}>
         <Col xs={24} md={12}><Form.Item name={["gitlab", "requestTimeoutSeconds"]} label="请求超时（秒）"><InputNumber min={1} style={{ width: "100%" }} /></Form.Item></Col>

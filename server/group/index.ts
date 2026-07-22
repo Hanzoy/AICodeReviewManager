@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import path from "node:path";
 import Fastify from "fastify";
 import { z } from "zod";
 import type {
@@ -14,8 +15,10 @@ import type {
 } from "../../shared/contracts.js";
 import { GroupConfigStore } from "./config-store.js";
 import { sendMergeRequestTriggeredNotification } from "./feishu-notifier.js";
+import { resolveGitLabProject } from "./gitlab-project-resolver.js";
 import { GroupIdentityStore } from "./identity-store.js";
 import { GitRepositoryService } from "./git-repository.js";
+import { GitOperationCoordinator } from "./git-operation-coordinator.js";
 import { ProjectStore, type GitLabMergeRequestPayload } from "./project-store.js";
 import { ReviewWorker } from "./review-worker.js";
 
@@ -138,6 +141,7 @@ const createProjectSchema = z.object({
   defaultBranch: z.string().trim().min(1).max(300)
 });
 const updateProjectSchema = createProjectSchema.omit({ key: true }).partial();
+const gitLabProjectQuerySchema = z.object({ ref: z.string().trim().min(1).max(300) });
 const manualReviewSelectionSchema = z.object({
   mode: z.enum(["commits", "branch"]),
   commitShas: z.array(z.string().trim().min(7).max(40)).max(50).default([]),
@@ -151,6 +155,7 @@ const createManualReviewSchema = z.object({
 const commitQuerySchema = z.object({
   branch: z.string().trim().max(300).optional(),
   search: z.string().trim().max(300).optional(),
+  author: z.string().trim().max(300).optional(),
   since: z.string().trim().max(40).optional(),
   until: z.string().trim().max(40).optional(),
   page: z.coerce.number().int().min(1).default(1),
@@ -185,7 +190,11 @@ await configStore.init();
 let groupConfig = await configStore.get();
 const projectStore = new ProjectStore(dataDir, managerUrl, groupId);
 await projectStore.init();
-const gitRepository = new GitRepositoryService();
+const gitCoordinator = new GitOperationCoordinator();
+const gitRepository = new GitRepositoryService(
+  path.resolve(dataDir, "cache", "commit-graphs"),
+  dataDir
+);
 
 function integrationStatuses(config: GroupNodeConfig): GroupNodeRuntimeStatus["integrations"] {
   return {
@@ -200,7 +209,7 @@ function integrationStatuses(config: GroupNodeConfig): GroupNodeRuntimeStatus["i
 }
 
 const app = Fastify({ logger: true });
-const reviewWorker = new ReviewWorker(dataDir, projectStore, configStore, app.log);
+const reviewWorker = new ReviewWorker(dataDir, projectStore, configStore, app.log, gitCoordinator);
 
 async function notifyMergeRequestTriggered(taskId: string) {
   const task = (await projectStore.listTasks()).find((item) => item.id === taskId);
@@ -271,6 +280,11 @@ app.get("/api/dashboard", async () => ({
 app.get("/api/projects", async () => ({
   items: await projectStore.list(groupConfig.repository.rootPath)
 }));
+app.get<{ Querystring: Record<string, unknown> }>("/api/gitlab/projects/resolve", async (request) => {
+  const query = gitLabProjectQuerySchema.parse(request.query);
+  const { config, gitlabToken } = await configStore.getExecutionContext();
+  return resolveGitLabProject(config.gitlab, gitlabToken, query.ref);
+});
 app.get<{ Params: { projectId: string } }>("/api/projects/:projectId", async (request) =>
   projectStore.getProject(request.params.projectId, groupConfig.repository.rootPath)
 );
@@ -309,6 +323,20 @@ app.get<{ Params: { projectId: string }; Querystring: Record<string, unknown> }>
   async (request) => {
     const project = await projectStore.getProject(request.params.projectId, groupConfig.repository.rootPath);
     return gitRepository.commits(project, commitQuerySchema.parse(request.query));
+  }
+);
+app.post<{ Params: { projectId: string } }>(
+  "/api/projects/:projectId/repository/sync",
+  async (request) => {
+    const project = await projectStore.getProject(request.params.projectId, groupConfig.repository.rootPath);
+    const { config, gitlabToken } = await configStore.getExecutionContext();
+    if (!gitlabToken) throw new Error("GITLAB_CONNECTION_NOT_CONFIGURED");
+    return gitCoordinator.run(project.id, () => gitRepository.sync(project, {
+      cloneDepth: config.repository.cloneDepth,
+      requestTimeoutSeconds: config.gitlab.requestTimeoutSeconds,
+      gitlabToken,
+      gitlabConfig: config.gitlab
+    }));
   }
 );
 app.post<{ Params: { projectId: string } }>(
