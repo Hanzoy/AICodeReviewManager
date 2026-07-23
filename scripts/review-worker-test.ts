@@ -121,7 +121,7 @@ try {
       "  for (const [name, value] of Object.entries(expected)) { if (process.env[name] !== value) { console.error(`invalid ${name}`); process.exit(3); } }",
       "  if (!process.argv.includes('--safe-mode') || !process.argv.includes('--no-session-persistence')) { console.error('Review safety flags are missing'); process.exit(4); }",
       "  if (!process.argv.includes('--add-dir') || !prompt.includes('<prepared_diff>')) { console.error('Prepared diff was not exposed to the Review runtime'); process.exit(5); }",
-      "  if (allowedTools.includes(':*') || !allowedTools.includes('Bash(git --no-pager show *)')) { console.error('Read-only Git tool patterns are invalid'); process.exit(6); }",
+      "  if (allowedTools.includes(':*') || allowedTools.includes('git status') || !allowedTools.includes('Bash(git --no-pager show *)')) { console.error('Read-only Git tool patterns are invalid'); process.exit(6); }",
       "  const result = { verdict: 'comment', riskLevel: 'medium', summary: '发现一个可验证的问题。', findings: [{ severity: 'medium', title: '示例问题', file: 'sample.ts', line: 1, description: '测试 Review Worker 的结构化结果。', suggestion: '修正示例实现。' }], positives: ['输出格式正确'] };",
       "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, structured_output: result }));",
       "  process.exit(0);",
@@ -192,7 +192,16 @@ try {
 
   const queuedTask = (await projectStore.listTasks())[0];
   const workerConfig = (await configStore.getExecutionContext()).config;
-  if (!buildReviewPrompt(queuedTask, workerConfig).includes("origin/main")) {
+  const queuedPrompt = buildReviewPrompt(queuedTask, workerConfig, {
+    filePath: "review-input.patch",
+    byteLength: 1,
+    truncated: false
+  });
+  if (
+    !queuedPrompt.includes("origin/main") ||
+    !queuedPrompt.includes("refs/remotes/origin/merge-requests/1/head") ||
+    !queuedPrompt.includes("共享工作树不保证指向审查目标")
+  ) {
     throw new Error("Review prompt did not include the target branch diff boundary");
   }
 
@@ -218,6 +227,10 @@ try {
   );
   if (!preparedDiff.includes("sample.ts") || !preparedDiff.includes("export const value = 2")) {
     throw new Error("Review Worker did not prepare the actual Git diff before invoking AI");
+  }
+  const repositoryHead = await command("git", ["rev-parse", "HEAD"], credentials.project.localRepositoryPath);
+  if (repositoryHead === headSha) {
+    throw new Error("Review Worker unexpectedly checked out the MR head in the shared worktree");
   }
   if (!postedComment.includes("DeepSeek 自动 Code Review") || /claude/i.test(postedComment)) {
     throw new Error("GitLab comment exposed an unexpected Review runtime implementation detail");

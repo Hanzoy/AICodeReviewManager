@@ -9,7 +9,7 @@ import type {
   ReviewProject,
   ReviewTask
 } from "../../shared/contracts.js";
-import { withGitSafeDirectory } from "./git-auth.js";
+import { withGitConfig, withGitSafeDirectory } from "./git-auth.js";
 import type { GroupConfigStore } from "./config-store.js";
 import { resolveGitRepositoryAccess } from "./git-auth.js";
 import { GitOperationCoordinator } from "./git-operation-coordinator.js";
@@ -113,6 +113,14 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function commandDescription(command: string, args: string[]) {
+  const executable = path.basename(command).toLowerCase().replace(/\.exe$/, "");
+  if (executable !== "git") return command;
+  let index = 0;
+  while (args[index] === "-c") index += 2;
+  return args[index] ? `git ${args[index]}` : command;
+}
+
 export async function resolveReviewRuntimeInvocation(configuredCommand: string) {
   const command = configuredCommand.trim().replace(/^"(.*)"$/, "$1");
   if (command.toLowerCase().endsWith(".js")) {
@@ -169,7 +177,8 @@ export function buildReviewPrompt(
     `Bytes: ${reviewInput.byteLength}`,
     `Truncated: ${reviewInput.truncated ? "yes" : "no"}`,
     "应用程序已经生成本次审查范围的真实 Git Patch。必须优先使用 Read/Grep 分段读取该文件，再结合仓库源码进行审查。",
-    "当前工作目录已经是目标 Git 仓库；如需补充 Git 信息，只能直接运行白名单内的 git 命令，不要使用 cd、&&、git -C 或 shell 包装。",
+    "当前工作目录是目标 Git 对象库，但为避免大型仓库全量 Checkout，共享工作树不保证指向审查目标；不得使用当前 HEAD 或工作树推断审查范围。",
+    "如需补充源码上下文，使用白名单内的 git show <明确的审查 ref>:<path>；不要使用 cd、&&、git -C 或 shell 包装。",
     "不得以 Bash 权限、无法执行 Git 或缺少 diff 为由跳过审查。",
     "</prepared_diff>"
   ] : [];
@@ -213,7 +222,7 @@ export function buildReviewPrompt(
     "</review_context>",
     ...inputInstruction,
     "",
-    `使用 Git 检查 \`origin/${task.targetBranch}\` 与当前 HEAD 的 merge-base，并将审查范围严格限定为该 merge-base 到 HEAD 的差异。`,
+    `使用 Git 检查 \`origin/${task.targetBranch}\` 与 \`refs/remotes/origin/merge-requests/${task.mergeRequestIid}/head\` 的 merge-base，并将审查范围严格限定为该 merge-base 到 MR ref 的差异。`,
     "最终响应只允许包含 JSON Schema 要求的对象。"
   ].join("\n");
 }
@@ -253,7 +262,7 @@ function deepSeekEnvironment(config: GroupNodeConfig, apiKey: string, repository
   env.ANTHROPIC_DEFAULT_HAIKU_MODEL = config.ai.fastModel;
   env.CLAUDE_CODE_SUBAGENT_MODEL = config.ai.subagentModel;
   env.CLAUDE_CODE_EFFORT_LEVEL = config.ai.reasoningEffort;
-  return withGitSafeDirectory(env, repositoryPath);
+  return withGitSafeDirectory(withGitConfig(env, "core.autocrlf", "input"), repositoryPath);
 }
 
 const verdictLabels: Record<ReviewResult["verdict"], string> = {
@@ -505,9 +514,11 @@ export class ReviewWorker {
       gitlabConfig: config.gitlab,
       gitlabToken
     });
-    const { environment, repositoryUrl } = access;
+    // Repositories may be bind-mounted between Windows and Linux. Use one
+    // clean-filter policy so CRLF/LF differences are not mistaken for edits.
+    const environment = withGitConfig(access.environment, "core.autocrlf", "input");
+    const { repositoryUrl } = access;
     let repositoryExists = false;
-    let repositoryCreated = false;
     try {
       repositoryExists = (await stat(gitDirectory)).isDirectory();
     } catch {
@@ -540,23 +551,6 @@ export class ReviewWorker {
         env: environment,
         timeoutMs: config.gitlab.requestTimeoutSeconds * 1000 * 10
       });
-      repositoryCreated = true;
-    }
-
-    if (!repositoryCreated) {
-      const status = await this.runCommand("git", [
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
-        "--ignore-submodules=all"
-      ], {
-        cwd: repositoryPath,
-        env: environment,
-        timeoutMs: 30_000
-      });
-      if (status.stdout.trim()) {
-        throw new Error(`仓库存在未提交修改，已停止自动切换分支：${repositoryPath}`);
-      }
     }
 
     await this.runCommand("git", ["remote", "set-url", "origin", repositoryUrl], {
@@ -591,22 +585,22 @@ export class ReviewWorker {
     });
 
     if (task.triggerType === "manual" && task.manualSelection) {
-      const checkoutRef = task.manualSelection.mode === "branch"
-        ? `refs/remotes/origin/${task.manualSelection.branch}`
-        : task.manualSelection.commitShas.at(-1);
-      if (!checkoutRef) throw new Error("手动 Review 没有可用的 Checkout 目标");
-      for (const sha of task.manualSelection.commitShas) {
-        await this.runCommand("git", ["rev-parse", "--verify", `${sha}^{commit}`], {
+      const selection = task.manualSelection;
+      const branch = selection.branch?.trim();
+      if (selection.mode === "branch" && !branch) {
+        throw new Error("手动分支 Review 没有可用的分支 Ref");
+      }
+      const refsToVerify = selection.mode === "branch"
+        ? [`refs/remotes/origin/${branch}^{commit}`]
+        : selection.commitShas.map((sha) => `${sha}^{commit}`);
+      if (refsToVerify.length === 0) throw new Error("手动 Review 没有可用的 Git Ref");
+      for (const ref of refsToVerify) {
+        await this.runCommand("git", ["rev-parse", "--verify", ref], {
           cwd: repositoryPath,
           env: environment,
           timeoutMs: 30_000
         });
       }
-      await this.runCommand("git", ["checkout", "--detach", checkoutRef], {
-        cwd: repositoryPath,
-        env: environment,
-        timeoutMs: 120_000
-      });
       return repositoryPath;
     }
 
@@ -619,11 +613,6 @@ export class ReviewWorker {
     if (fetchedHead.stdout.trim().toLowerCase() !== task.headSha.toLowerCase()) {
       throw new Error(`MR HEAD 已变化：Webhook=${task.headSha}，GitLab=${fetchedHead.stdout.trim()}`);
     }
-    await this.runCommand("git", ["checkout", "--detach", mrRef], {
-      cwd: repositoryPath,
-      env: environment,
-      timeoutMs: 120_000
-    });
     return repositoryPath;
   }
 
@@ -652,8 +641,6 @@ export class ReviewWorker {
         "Glob",
         "Grep",
         "Agent",
-        "Bash(git status)",
-        "Bash(git status *)",
         "Bash(git diff *)",
         "Bash(git show *)",
         "Bash(git log *)",
@@ -770,7 +757,7 @@ export class ReviewWorker {
       const targetRef = `refs/remotes/origin/${task.targetBranch}`;
       const headRef = task.triggerType === "manual" && task.manualSelection?.branch
         ? `refs/remotes/origin/${task.manualSelection.branch}`
-        : "HEAD";
+        : `refs/remotes/origin/merge-requests/${task.mergeRequestIid}/head`;
       const mergeBase = await this.runCommand("git", ["merge-base", targetRef, headRef], {
         cwd: repositoryPath,
         timeoutMs: 30_000
@@ -804,7 +791,11 @@ export class ReviewWorker {
       const child = spawn("git", args, {
         cwd: repositoryPath,
         env: withGitSafeDirectory(
-          { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          withGitConfig(
+            { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+            "core.autocrlf",
+            "input"
+          ),
           repositoryPath
         ),
         windowsHide: true,
@@ -902,6 +893,7 @@ export class ReviewWorker {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      const description = commandDescription(command, args);
       const commandEnvironment = options.env ?? process.env;
       const environment = path.basename(command).toLowerCase() === "git"
         ? withGitSafeDirectory(commandEnvironment, options.cwd)
@@ -918,7 +910,7 @@ export class ReviewWorker {
       child.stderr.on("data", (chunk: Buffer) => { stderr = appendLimited(stderr, chunk); });
       child.once("error", (error) => {
         this.currentChild = undefined;
-        reject(new Error(`无法启动命令 ${command}：${error.message}`));
+        reject(new Error(`无法启动命令 ${description}：${error.message}`));
       });
       const timer = setTimeout(() => {
         timedOut = true;
@@ -931,13 +923,13 @@ export class ReviewWorker {
         const detail = (stderr.trim() || stdout.trim()).slice(-4000);
         if (timedOut) {
           reject(new CommandExecutionError(
-            `命令执行超时（${options.timeoutMs / 1000} 秒）：${command}${detail ? `：${detail}` : ""}`,
+            `命令执行超时（${options.timeoutMs / 1000} 秒）：${description}${detail ? `：${detail}` : ""}`,
             stdout,
             stderr
           ));
         } else if (code !== 0) {
           reject(new CommandExecutionError(
-            `命令执行失败 ${command}（exit=${code}, signal=${signal ?? "none"}）：${detail}`,
+            `命令执行失败 ${description}（exit=${code}, signal=${signal ?? "none"}）：${detail}`,
             stdout,
             stderr
           ));

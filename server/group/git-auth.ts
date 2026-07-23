@@ -9,17 +9,25 @@ export interface GitRepositoryAccess {
   authentication: "gitlab-token" | "local";
 }
 
-export function withGitSafeDirectory(
+export function withGitConfig(
   environment: NodeJS.ProcessEnv,
-  repositoryPath: string
+  key: string,
+  value: string
 ): NodeJS.ProcessEnv {
   const next = { ...environment };
   const configuredCount = Number.parseInt(next.GIT_CONFIG_COUNT ?? "0", 10);
   const count = Number.isSafeInteger(configuredCount) && configuredCount >= 0 ? configuredCount : 0;
   next.GIT_CONFIG_COUNT = String(count + 1);
-  next[`GIT_CONFIG_KEY_${count}`] = "safe.directory";
-  next[`GIT_CONFIG_VALUE_${count}`] = path.resolve(repositoryPath);
+  next[`GIT_CONFIG_KEY_${count}`] = key;
+  next[`GIT_CONFIG_VALUE_${count}`] = value;
   return next;
+}
+
+export function withGitSafeDirectory(
+  environment: NodeJS.ProcessEnv,
+  repositoryPath: string
+): NodeJS.ProcessEnv {
+  return withGitConfig(environment, "safe.directory", path.resolve(repositoryPath));
 }
 
 export async function gitEnvironment(

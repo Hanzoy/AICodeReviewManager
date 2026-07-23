@@ -251,13 +251,11 @@ npm run start:manager
 每个任务会依次执行：
 
 1. 复用项目唯一的本地仓库；目录不存在时使用 `--no-checkout --single-branch --filter=blob:none` Clone，避免先检出一次默认分支并下载无关历史 Blob。
-2. 复用已有仓库时检查已跟踪文件的未提交修改；跳过代价很高的未跟踪文件全量扫描，真正 Checkout 发生文件冲突时 Git 仍会拒绝覆盖。
-3. Fetch `refs/merge-requests/{iid}/head` 和目标分支，并校验 HEAD SHA。
-4. Detached Checkout 到 MR HEAD。
-5. Worker 先把本次审查范围的真实 Git Patch 写入 `review-artifacts/{taskId}/review-input.patch`；MR 任务生成 merge-base 到 HEAD 的差异，手动任务逐个生成所选 Commit 的精确差异。
-6. 将该 Patch 目录以只读方式提供给 DeepSeek Review 运行时，并配合只读工具白名单和 JSON Schema 执行非交互 Review。
-7. 解析固定结构的结论、风险等级与 Findings。
-8. 调用 GitLab Notes API，将 Markdown Review 结果发布到对应 MR。
+2. Fetch `refs/merge-requests/{iid}/head` 和目标分支，并校验 HEAD SHA；手动任务校验所有选中的 Commit 或分支 Ref。
+3. 不切换共享工作树，直接从 Git 对象库生成本次审查范围的真实 Patch 并写入 `review-artifacts/{taskId}/review-input.patch`；MR 任务生成 merge-base 到 MR Ref 的差异，手动任务逐个生成所选 Commit 的精确差异。
+4. 将该 Patch 目录以只读方式提供给 DeepSeek Review 运行时，并配合只读工具白名单和 JSON Schema 执行非交互 Review；需要额外源码上下文时通过明确 Ref 的 `git show` 读取。
+5. 解析固定结构的结论、风险等级与 Findings。
+6. 调用 GitLab Notes API，将 Markdown Review 结果发布到对应 MR。
 
 DeepSeek API Key 只保存在项目组节点的 AES-256-GCM 加密文件中。执行日志、输入 Patch 和结构化结果保存在对应任务的 `review-artifacts/{taskId}` 下，便于排查失败。如果模型返回“无法获取或读取 Diff”且没有任何 Finding，Worker 会把任务标记为失败，不会将无效结果记录为 Review 完成。
 
