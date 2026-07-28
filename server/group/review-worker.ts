@@ -177,7 +177,7 @@ export function buildReviewPrompt(
     `Bytes: ${reviewInput.byteLength}`,
     `Truncated: ${reviewInput.truncated ? "yes" : "no"}`,
     "应用程序已经生成本次审查范围的真实 Git Patch。必须优先使用 Read/Grep 分段读取该文件，再结合仓库源码进行审查。",
-    "当前工作目录是目标 Git 对象库，但为避免大型仓库全量 Checkout，共享工作树不保证指向审查目标；不得使用当前 HEAD 或工作树推断审查范围。",
+    "当前工作目录是隔离的 Review Artifact 目录，GIT_DIR 已指向目标 Git 对象库；共享工作树不会提供给 Review 执行器，不得使用当前 HEAD 或工作树推断审查范围。",
     "如需补充源码上下文，使用白名单内的 git show <明确的审查 ref>:<path>；不要使用 cd、&&、git -C 或 shell 包装。",
     "不得以 Bash 权限、无法执行 Git 或缺少 diff 为由跳过审查。",
     "</prepared_diff>"
@@ -262,7 +262,18 @@ function deepSeekEnvironment(config: GroupNodeConfig, apiKey: string, repository
   env.ANTHROPIC_DEFAULT_HAIKU_MODEL = config.ai.fastModel;
   env.CLAUDE_CODE_SUBAGENT_MODEL = config.ai.subagentModel;
   env.CLAUDE_CODE_EFFORT_LEVEL = config.ai.reasoningEffort;
-  return withGitSafeDirectory(withGitConfig(env, "core.autocrlf", "input"), repositoryPath);
+  env.GIT_DIR = path.join(repositoryPath, ".git");
+  delete env.GIT_WORK_TREE;
+  env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return withGitSafeDirectory(
+    withGitConfig(
+      withGitConfig(env, "core.autocrlf", "input"),
+      "core.bare",
+      "true"
+    ),
+    repositoryPath
+  );
 }
 
 const verdictLabels: Record<ReviewResult["verdict"], string> = {
@@ -662,7 +673,7 @@ export class ReviewWorker {
     let commandResult: CommandResult;
     try {
       commandResult = await this.runCommand(invocation.command, [...invocation.argsPrefix, ...args], {
-        cwd: repositoryPath,
+        cwd: artifactDirectory,
         env: deepSeekEnvironment(config, apiKey, repositoryPath),
         input: buildReviewPrompt(task, config, reviewInput),
         timeoutMs: config.ai.requestTimeoutSeconds * 1000

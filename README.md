@@ -64,6 +64,11 @@ docker compose ps
 docker compose logs -f manager web
 ```
 
+默认同时发布 Manager API 的宿主机端口 `7000`，用于兼容已有的直连 Webhook；
+新建或重新复制的 Webhook URL 使用 `MANAGER_PUBLIC_URL`，推荐统一通过 `5173` 的
+`/hooks/*` 反向代理入口访问。可用 `MANAGER_BIND_ADDRESS` 和 `MANAGER_API_PORT`
+调整直连监听地址和端口。
+
 ### 2. 启动项目组节点
 
 先在管理界面创建项目组并点击“注册节点”，复制弹窗中的“项目组 ID”和“注册代码”。然后为该节点准备独立配置：
@@ -253,7 +258,7 @@ npm run start:manager
 1. 复用项目唯一的本地仓库；目录不存在时使用 `--no-checkout --single-branch --filter=blob:none` Clone，避免先检出一次默认分支并下载无关历史 Blob。
 2. Fetch `refs/merge-requests/{iid}/head` 和目标分支，并校验 HEAD SHA；手动任务校验所有选中的 Commit 或分支 Ref。
 3. 不切换共享工作树，直接从 Git 对象库生成本次审查范围的真实 Patch 并写入 `review-artifacts/{taskId}/review-input.patch`；MR 任务生成 merge-base 到 MR Ref 的差异，手动任务逐个生成所选 Commit 的精确差异。
-4. 将该 Patch 目录以只读方式提供给 DeepSeek Review 运行时，并配合只读工具白名单和 JSON Schema 执行非交互 Review；需要额外源码上下文时通过明确 Ref 的 `git show` 读取。
+4. DeepSeek Review 运行时以隔离的 Artifact 目录作为工作目录，只通过 `GIT_DIR` 连接目标对象库，并配合只读工具白名单和 JSON Schema 执行非交互 Review；需要额外源码上下文时通过明确 Ref 的 `git show` 读取，不扫描共享工作树。
 5. 解析固定结构的结论、风险等级与 Findings。
 6. 调用 GitLab Notes API，将 Markdown Review 结果发布到对应 MR。
 

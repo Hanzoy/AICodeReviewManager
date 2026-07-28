@@ -6,6 +6,7 @@ export interface GroupNodeIdentity {
   nodeId: string;
   nodeToken: string;
   managerUrl: string;
+  managerPublicUrl?: string;
   registeredAt: string;
 }
 

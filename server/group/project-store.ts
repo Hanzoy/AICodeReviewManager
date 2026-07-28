@@ -65,11 +65,15 @@ export class ProjectStore {
 
   constructor(
     dataDir: string,
-    private readonly managerUrl: string,
+    private managerUrl: string,
     private readonly groupId: string
   ) {
     this.projectsFile = path.join(dataDir, "projects.json");
     this.tasksFile = path.join(dataDir, "review-queue.json");
+  }
+
+  setManagerUrl(managerUrl: string) {
+    this.managerUrl = managerUrl;
   }
 
   async init() {

@@ -70,6 +70,7 @@ export interface NodeRegistrationResult {
   nodeId: string;
   nodeToken: string;
   heartbeatIntervalSeconds: number;
+  managerPublicUrl: string;
 }
 
 export interface NodeHeartbeatInput {

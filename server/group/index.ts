@@ -47,6 +47,7 @@ const host = argument("host") ?? process.env.GROUP_HOST ?? "127.0.0.1";
 const requestedPort = Number(argument("port") ?? process.env.GROUP_PORT ?? 0);
 const configuredPublicUrl = argument("public-url") ?? process.env.GROUP_PUBLIC_URL;
 const managerUrlArg = argument("manager-url") ?? process.env.MANAGER_URL;
+const managerPublicUrlArg = argument("manager-public-url") ?? process.env.MANAGER_PUBLIC_URL;
 const groupIdArg = argument("group-id") ?? process.env.GROUP_ID;
 const enrollmentToken = argument("enroll-token") ?? process.env.ENROLL_TOKEN;
 const groupName = argument("name") ?? process.env.GROUP_NAME ?? "项目组节点";
@@ -65,6 +66,7 @@ const groupId = groupIdArg ?? savedIdentity?.groupId;
 if (!managerUrl || !groupId) {
   throw new Error("首次启动必须提供 --manager-url、--group-id 和 --enroll-token");
 }
+let managerPublicUrl = managerPublicUrlArg ?? savedIdentity?.managerPublicUrl ?? managerUrl;
 
 const urlOrEmpty = z.union([z.string().url(), z.literal("")]);
 const configUpdateSchema = z.object({
@@ -190,7 +192,7 @@ const mergeRequestWebhookSchema = z.object({
 const configStore = new GroupConfigStore(dataDir, groupName, repositoryRootOverride);
 await configStore.init();
 let groupConfig = await configStore.get();
-const projectStore = new ProjectStore(dataDir, managerUrl, groupId);
+const projectStore = new ProjectStore(dataDir, managerPublicUrl, groupId);
 await projectStore.init();
 const gitCoordinator = new GitOperationCoordinator();
 const gitRepository = new GitRepositoryService(
@@ -446,7 +448,7 @@ let heartbeatIntervalSeconds = 15;
 
 try {
   if (identity) {
-    const result = await requestJson<{ heartbeatIntervalSeconds: number }>(
+    const result = await requestJson<{ heartbeatIntervalSeconds: number; managerPublicUrl: string }>(
       `${managerUrl}/api/nodes/reconnect`,
       {
         method: "POST",
@@ -458,6 +460,10 @@ try {
       }
     );
     heartbeatIntervalSeconds = result.heartbeatIntervalSeconds;
+    managerPublicUrl = result.managerPublicUrl;
+    projectStore.setManagerUrl(managerPublicUrl);
+    identity = { ...identity, managerPublicUrl };
+    await identityStore.save(identity);
   } else {
     if (!enrollmentToken) throw new Error("首次启动缺少 --enroll-token");
     const result = await requestJson<NodeRegistrationResult>(`${managerUrl}/api/nodes/register`, {
@@ -469,11 +475,14 @@ try {
       body: JSON.stringify(registration)
     });
     heartbeatIntervalSeconds = result.heartbeatIntervalSeconds;
+    managerPublicUrl = result.managerPublicUrl;
+    projectStore.setManagerUrl(managerPublicUrl);
     identity = {
       groupId,
       nodeId: result.nodeId,
       nodeToken: result.nodeToken,
       managerUrl,
+      managerPublicUrl,
       registeredAt: new Date().toISOString()
     };
     await identityStore.save(identity);

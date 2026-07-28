@@ -263,7 +263,8 @@ export class ManagerFileStore {
       return {
         nodeId: group.node.id,
         nodeToken,
-        heartbeatIntervalSeconds: 15
+        heartbeatIntervalSeconds: 15,
+        managerPublicUrl: this.managerPublicUrl
       };
     });
   }
@@ -289,7 +290,10 @@ export class ManagerFileStore {
       };
       group.updatedAt = now;
       await this.atomicWrite(this.groupFile(group.id), group);
-      return { heartbeatIntervalSeconds: 15 };
+      return {
+        heartbeatIntervalSeconds: 15,
+        managerPublicUrl: this.managerPublicUrl
+      };
     });
   }
 

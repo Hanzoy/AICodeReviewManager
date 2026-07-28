@@ -115,6 +115,7 @@ try {
     [
       "if (process.argv.includes('--json-schema')) {",
       "  const { readFileSync } = await import('node:fs');",
+      "  const { execFileSync } = await import('node:child_process');",
       "  const prompt = readFileSync(0, 'utf8');",
       "  const allowedTools = process.argv[process.argv.indexOf('--allowedTools') + 1] || '';",
       "  const expected = { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_AUTH_TOKEN: 'deepseek-integration-test-key', ANTHROPIC_MODEL: 'deepseek-test-model', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-flash', CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash' };",
@@ -122,6 +123,10 @@ try {
       "  if (!process.argv.includes('--safe-mode') || !process.argv.includes('--no-session-persistence')) { console.error('Review safety flags are missing'); process.exit(4); }",
       "  if (!process.argv.includes('--add-dir') || !prompt.includes('<prepared_diff>')) { console.error('Prepared diff was not exposed to the Review runtime'); process.exit(5); }",
       "  if (allowedTools.includes(':*') || allowedTools.includes('git status') || !allowedTools.includes('Bash(git --no-pager show *)')) { console.error('Read-only Git tool patterns are invalid'); process.exit(6); }",
+      "  if (!process.env.GIT_DIR || process.cwd().includes('repositories')) { console.error('Review runtime was not isolated from the shared worktree'); process.exit(7); }",
+      "  const reviewRef = prompt.match(/refs\\/remotes\\/origin\\/merge-requests\\/\\d+\\/head/)?.[0] || 'HEAD';",
+      "  const reviewedSource = execFileSync('git', ['show', `${reviewRef}:sample.ts`], { encoding: 'utf8' });",
+      "  if (!reviewedSource.includes('export const value')) { console.error('Review runtime could not read the Git object database'); process.exit(8); }",
       "  const result = { verdict: 'comment', riskLevel: 'medium', summary: '发现一个可验证的问题。', findings: [{ severity: 'medium', title: '示例问题', file: 'sample.ts', line: 1, description: '测试 Review Worker 的结构化结果。', suggestion: '修正示例实现。' }], positives: ['输出格式正确'] };",
       "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, structured_output: result }));",
       "  process.exit(0);",
@@ -200,7 +205,7 @@ try {
   if (
     !queuedPrompt.includes("origin/main") ||
     !queuedPrompt.includes("refs/remotes/origin/merge-requests/1/head") ||
-    !queuedPrompt.includes("共享工作树不保证指向审查目标")
+    !queuedPrompt.includes("GIT_DIR 已指向目标 Git 对象库")
   ) {
     throw new Error("Review prompt did not include the target branch diff boundary");
   }
